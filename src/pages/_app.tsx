@@ -1,0 +1,17 @@
+import type { AppProps } from "next/app";
+import Head from "next/head";
+import "../styles/globals.css";
+
+export default function MyApp({ Component, pageProps }: AppProps) {
+  return (
+    <>
+      <Head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="theme-color" content="#4f46e5" />
+        <link rel="manifest" href="/manifest.json" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/icon-192.png" />
+      </Head>
+      <Component {...pageProps} />
+    </>
+  );
+}
