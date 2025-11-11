@@ -8,22 +8,13 @@ const withPWA = require( "next-pwa" )( {
 const isProd = process.env.NODE_ENV === "production";
 
 const nextConfig = {
-  output: "export", // 👈 quan trọng cho GitHub Pages
+  output: "export", // cần cho GitHub Pages
   reactStrictMode: true,
   swcMinify: true,
   images: {
-    unoptimized: true, // 👈 tránh lỗi build khi export
-    domains: [ "localhost" ],
-    remotePatterns: [
-      {
-        protocol: "http",
-        hostname: "localhost",
-        port: "*",
-        pathname: "/uploads/**",
-      },
-    ],
+    unoptimized: true,
   },
-  basePath: isProd ? "/frontend_todo" : "", // 👈 repo name
+  basePath: isProd ? "/frontend_todo" : "",
   assetPrefix: isProd ? "/frontend_todo/" : "",
 };
 
