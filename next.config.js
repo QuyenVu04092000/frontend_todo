@@ -1,21 +1,22 @@
-const withPWA = require( "next-pwa" )( {
+const withPWA = require("next-pwa")({
   dest: "public",
   register: true,
   skipWaiting: true,
-  disable: process.env.NODE_ENV === "development",
-} );
+  disable: process.env.NODE_ENV === "development"
+});
 
-const isProd = process.env.NODE_ENV === "production";
-
-const nextConfig = {
-  output: "export", // cần cho GitHub Pages
+module.exports = withPWA({
   reactStrictMode: true,
   swcMinify: true,
   images: {
-    unoptimized: true,
-  },
-  basePath: isProd ? "/frontend_todo" : "",
-  assetPrefix: isProd ? "/frontend_todo/" : "",
-};
-
-module.exports = withPWA( nextConfig );
+    domains: ["localhost"],
+    remotePatterns: [
+      {
+        protocol: "http",
+        hostname: "localhost",
+        port: "*",
+        pathname: "/uploads/**"
+      }
+    ]
+  }
+});

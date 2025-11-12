@@ -1,7 +1,7 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type { Todo } from "../services/api";
 import { API_URL } from "../services/api";
-import { formatDateForDisplay } from "../utils/timeline";
+import { formatDateForDisplay, formatDateForInput } from "../utils/timeline";
 
 interface TodoDetailsModalProps {
   todo: Todo;
@@ -12,6 +12,16 @@ interface TodoDetailsModalProps {
     values: { title: string; description?: string }
   ) => Promise<void>;
   onToggleSubTodo: (subTodo: Todo, completed: boolean) => Promise<void>;
+  onDeleteTodo: (todo: Todo) => Promise<void>;
+  onDeleteSubTodo: (subTodo: Todo) => Promise<void>;
+  onUpdateDetails: (
+    todo: Todo,
+    values: { title: string; description: string | null }
+  ) => Promise<void>;
+  onUpdateTimeline: (
+    todo: Todo,
+    values: { startDate: string | null; endDate: string | null }
+  ) => Promise<void>;
 }
 
 const STATUS_TEXT: Record<Todo["status"], string> = {
@@ -26,6 +36,10 @@ export default function TodoDetailsModal({
   onUpdateStatus,
   onCreateSubTodo,
   onToggleSubTodo,
+  onDeleteTodo,
+  onDeleteSubTodo,
+  onUpdateDetails,
+  onUpdateTimeline,
 }: TodoDetailsModalProps) {
   const createdAt = useMemo(
     () => new Date(todo.createdAt).toLocaleString(),
@@ -40,6 +54,33 @@ export default function TodoDetailsModal({
   const [subDescription, setSubDescription] = useState("");
   const [isCreatingSubTodo, setIsCreatingSubTodo] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [startInput, setStartInput] = useState<string>(
+    formatDateForInput(todo.startDate)
+  );
+  const [endInput, setEndInput] = useState<string>(
+    formatDateForInput(todo.endDate)
+  );
+  const [isSavingTimeline, setIsSavingTimeline] = useState(false);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
+  const [timelineSuccess, setTimelineSuccess] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState<string>(todo.title);
+  const [editDescription, setEditDescription] = useState<string>(
+    todo.description ?? ""
+  );
+  const [isSavingDetails, setIsSavingDetails] = useState(false);
+  const [detailsError, setDetailsError] = useState<string | null>(null);
+  const [detailsSuccess, setDetailsSuccess] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEditTitle(todo.title);
+    setEditDescription(todo.description ?? "");
+    setDetailsError(null);
+    setDetailsSuccess(null);
+    setStartInput(formatDateForInput(todo.startDate));
+    setEndInput(formatDateForInput(todo.endDate));
+    setTimelineError(null);
+    setTimelineSuccess(null);
+  }, [todo.description, todo.endDate, todo.id, todo.startDate, todo.title]);
 
   const handleRootStatusChange = async (nextStatus: Todo["status"]) => {
     if (nextStatus === todo.status) return;
@@ -48,6 +89,98 @@ export default function TodoDetailsModal({
 
   const handleSubTodoToggle = async (subTodo: Todo, checked: boolean) => {
     await onToggleSubTodo(subTodo, checked);
+  };
+
+  const handleSubTodoDelete = async (subTodo: Todo) => {
+    setCreateError(null);
+    try {
+      await onDeleteSubTodo(subTodo);
+    } catch (error) {
+      setCreateError(
+        error instanceof Error ? error.message : "Failed to delete subtodo"
+      );
+    }
+  };
+
+  const handleTodoDelete = async () => {
+    try {
+      await onDeleteTodo(todo);
+      onClose();
+    } catch (error) {
+      setCreateError(
+        error instanceof Error ? error.message : "Failed to delete todo"
+      );
+    }
+  };
+
+  const handleDetailsReset = () => {
+    setEditTitle(todo.title);
+    setEditDescription(todo.description ?? "");
+    setDetailsError(null);
+    setDetailsSuccess(null);
+  };
+
+  const handleDetailsSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const trimmedTitle = editTitle.trim();
+    const trimmedDescription = editDescription.trim();
+    if (!trimmedTitle) {
+      setDetailsError("Title is required");
+      setDetailsSuccess(null);
+      return;
+    }
+
+    const currentDescription = (todo.description ?? "").trim();
+    if (
+      trimmedTitle === todo.title &&
+      trimmedDescription === currentDescription
+    ) {
+      setDetailsError(null);
+      setDetailsSuccess("No changes to save");
+      return;
+    }
+
+    setIsSavingDetails(true);
+    setDetailsError(null);
+    setDetailsSuccess(null);
+
+    try {
+      await onUpdateDetails(todo, {
+        title: trimmedTitle,
+        description: trimmedDescription ? trimmedDescription : null,
+      });
+      setEditTitle(trimmedTitle);
+      setEditDescription(trimmedDescription);
+      setDetailsSuccess("Todo details updated");
+    } catch (error) {
+      setDetailsError(
+        error instanceof Error ? error.message : "Failed to update todo"
+      );
+    } finally {
+      setIsSavingDetails(false);
+    }
+  };
+
+  const handleTimelineSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    setIsSavingTimeline(true);
+    setTimelineError(null);
+    setTimelineSuccess(null);
+
+    try {
+      await onUpdateTimeline(todo, {
+        startDate: startInput ? startInput : null,
+        endDate: endInput ? endInput : null,
+      });
+      setTimelineSuccess("Timeline updated");
+    } catch (error) {
+      setTimelineError(
+        error instanceof Error ? error.message : "Failed to update timeline"
+      );
+    }
+
+    setIsSavingTimeline(false);
   };
 
   const handleCreateSubTodoSubmit = async (
@@ -90,27 +223,100 @@ export default function TodoDetailsModal({
             <p className="mt-2 text-sm text-gray-500">
               Created at: {createdAt}
             </p>
-            {todo.pendingSync && (
-              <p className="mt-2 text-xs font-semibold uppercase tracking-wide text-orange-500">
-                Pending sync
-              </p>
-            )}
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-full border border-gray-300 px-3 py-1 text-sm text-gray-500 transition hover:bg-gray-100"
-          >
-            Close
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleTodoDelete}
+              className="rounded-full border border-red-200 px-3 py-1 text-sm font-semibold text-red-500 transition hover:bg-red-50"
+            >
+              Delete
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full border border-gray-300 px-3 py-1 text-sm text-gray-500 transition hover:bg-gray-100"
+            >
+              Close
+            </button>
+          </div>
         </header>
 
         <div className="space-y-6 p-6">
-          <section>
-            <h3 className="text-sm font-semibold text-gray-700">Description</h3>
-            <p className="mt-2 text-sm text-gray-600">
-              {todo.description || "No description provided"}
-            </p>
+          <section className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
+            <h3 className="text-sm font-semibold text-gray-700">
+              Edit details
+            </h3>
+            <form onSubmit={handleDetailsSubmit} className="mt-3 space-y-4">
+              <div className="grid gap-1">
+                <label
+                  className="text-xs font-semibold uppercase tracking-wide text-gray-500"
+                  htmlFor="todo-title"
+                >
+                  Title
+                </label>
+                <input
+                  id="todo-title"
+                  type="text"
+                  value={editTitle}
+                  onChange={(event) => {
+                    setEditTitle(event.target.value);
+                    setDetailsError(null);
+                    setDetailsSuccess(null);
+                  }}
+                  disabled={isSavingDetails}
+                  className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-70"
+                  placeholder="Project kickoff"
+                />
+              </div>
+              <div className="grid gap-1">
+                <label
+                  className="text-xs font-semibold uppercase tracking-wide text-gray-500"
+                  htmlFor="todo-description"
+                >
+                  Description
+                </label>
+                <textarea
+                  id="todo-description"
+                  value={editDescription}
+                  onChange={(event) => {
+                    setEditDescription(event.target.value);
+                    setDetailsError(null);
+                    setDetailsSuccess(null);
+                  }}
+                  disabled={isSavingDetails}
+                  className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-70"
+                  rows={4}
+                  placeholder="Context, goals, links..."
+                />
+              </div>
+              {(detailsError || detailsSuccess) && (
+                <p
+                  className={`text-sm ${
+                    detailsError ? "text-red-600" : "text-emerald-600"
+                  }`}
+                >
+                  {detailsError ?? detailsSuccess}
+                </p>
+              )}
+              <div className="flex items-center gap-3">
+                <button
+                  type="submit"
+                  disabled={isSavingDetails}
+                  className="inline-flex items-center rounded-full bg-brand-500 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {isSavingDetails ? "Saving…" : "Save changes"}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDetailsReset}
+                  disabled={isSavingDetails}
+                  className="rounded-full border border-gray-300 px-4 py-2 text-xs font-medium text-gray-600 transition hover:border-brand-500 hover:text-brand-500 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  Reset
+                </button>
+              </div>
+            </form>
           </section>
 
           {imageSrc && (
@@ -129,44 +335,88 @@ export default function TodoDetailsModal({
           <section>
             <h3 className="text-sm font-semibold text-gray-700">Status</h3>
             <div className="mt-2 flex flex-wrap items-center gap-3">
-              <span className="rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600">
-                Current: {STATUS_TEXT[todo.status]}
+              <span
+                className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${
+                  todo.status === "DONE"
+                    ? "bg-green-100 text-green-700"
+                    : todo.status === "IN_PROGRESS"
+                    ? "bg-yellow-100 text-yellow-700"
+                    : "bg-gray-100 text-gray-600"
+                }`}
+              >
+                {todo.status.replace("_", " ")}
               </span>
-              <select
+              {/* <select
                 value={todo.status}
                 onChange={(event) =>
                   handleRootStatusChange(event.target.value as Todo["status"])
                 }
-                disabled={todo.pendingSync}
                 className="rounded border border-gray-300 px-3 py-1 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 <option value="TODO">Chưa làm</option>
                 <option value="IN_PROGRESS">Đang làm</option>
                 <option value="DONE">Đã làm</option>
-              </select>
-              {todo.pendingSync && (
-                <span className="text-xs font-medium text-orange-500">
-                  Sync required before changes
-                </span>
-              )}
+              </select> */}
             </div>
           </section>
 
-          <section className="grid gap-1 md:grid-cols-2">
-            <div>
-              <h3 className="text-sm font-semibold text-gray-700">
+          <section className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
+            <h3 className="text-sm font-semibold text-gray-700">Timeline</h3>
+            <p className="mt-1 text-xs text-gray-500">
+              Set the planned start and end dates for this todo.
+            </p>
+            <form
+              onSubmit={handleTimelineSubmit}
+              className="mt-3 grid gap-3 md:grid-cols-2"
+            >
+              <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-gray-500">
                 Start date
-              </h3>
-              <p className="mt-1 text-sm text-gray-500">
-                {todo.startDate ? formatDateForDisplay(todo.startDate) : "-"}
-              </p>
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-gray-700">End date</h3>
-              <p className="mt-1 text-sm text-gray-500">
-                {todo.endDate ? formatDateForDisplay(todo.endDate) : "-"}
-              </p>
-            </div>
+                <input
+                  type="date"
+                  value={startInput}
+                  onChange={(event) => {
+                    setStartInput(event.target.value);
+                    setTimelineError(null);
+                    setTimelineSuccess(null);
+                  }}
+                  className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
+                  disabled={isSavingTimeline}
+                />
+              </label>
+              <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-gray-500">
+                End date
+                <input
+                  type="date"
+                  value={endInput}
+                  onChange={(event) => {
+                    setEndInput(event.target.value);
+                    setTimelineError(null);
+                    setTimelineSuccess(null);
+                  }}
+                  className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
+                  disabled={isSavingTimeline}
+                />
+              </label>
+              <div className="col-span-full flex flex-col gap-2 text-sm">
+                {timelineError && (
+                  <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-red-600">
+                    {timelineError}
+                  </p>
+                )}
+                {timelineSuccess && (
+                  <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-600">
+                    {timelineSuccess}
+                  </p>
+                )}
+                <button
+                  type="submit"
+                  disabled={isSavingTimeline}
+                  className="self-start rounded-full bg-brand-500 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {isSavingTimeline ? "Saving…" : "Save timeline"}
+                </button>
+              </div>
+            </form>
           </section>
 
           <section>
@@ -180,20 +430,19 @@ export default function TodoDetailsModal({
                 <p className="text-sm text-gray-500">No subtodos yet.</p>
               ) : (
                 todo.subtodos?.map((subTodo) => (
-                  <label
+                  <div
                     key={subTodo.id}
                     className="flex items-start gap-3 rounded-lg border border-gray-200 bg-gray-50 p-3"
                   >
                     <input
                       type="checkbox"
-                      className="mt-1 h-4 w-4 rounded border-gray-300 text-brand-500 focus:ring-brand-500 disabled:cursor-not-allowed disabled:opacity-60"
+                      className="mt-0.5 h-4 w-4 rounded border-gray-300 text-brand-500 focus:ring-brand-500"
                       checked={subTodo.status === "DONE"}
                       onChange={(event) =>
                         handleSubTodoToggle(subTodo, event.target.checked)
                       }
-                      disabled={Boolean(todo.pendingSync || subTodo.pendingSync)}
                     />
-                    <div>
+                    <div className="flex-1">
                       <p
                         className={`text-sm font-medium ${
                           subTodo.status === "DONE"
@@ -208,13 +457,17 @@ export default function TodoDetailsModal({
                           {subTodo.description}
                         </p>
                       )}
-                      {subTodo.pendingSync && (
-                        <p className="text-[10px] font-semibold uppercase tracking-wide text-orange-500">
-                          Pending sync
-                        </p>
-                      )}
                     </div>
-                  </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleSubTodoDelete(subTodo);
+                      }}
+                      className="rounded-full border border-red-200 px-3 py-1 text-xs font-semibold text-red-500 transition hover:bg-red-50"
+                    >
+                      Delete
+                    </button>
+                  </div>
                 ))
               )}
             </div>
@@ -233,15 +486,13 @@ export default function TodoDetailsModal({
                   value={subTitle}
                   onChange={(event) => setSubTitle(event.target.value)}
                   placeholder="Subtodo title"
-                  disabled={todo.pendingSync}
-                  className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
                 />
                 <textarea
                   value={subDescription}
                   onChange={(event) => setSubDescription(event.target.value)}
                   placeholder="Optional description"
-                  disabled={todo.pendingSync}
-                  className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
                   rows={2}
                 />
               </div>
@@ -251,7 +502,7 @@ export default function TodoDetailsModal({
               <div className="flex justify-end">
                 <button
                   type="submit"
-                  disabled={isCreatingSubTodo || todo.pendingSync}
+                  disabled={isCreatingSubTodo}
                   className="inline-flex items-center justify-center rounded-md bg-brand-500 px-3 py-1 text-sm font-semibold text-white transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:opacity-70"
                 >
                   {isCreatingSubTodo ? "Adding..." : "Add Subtodo"}

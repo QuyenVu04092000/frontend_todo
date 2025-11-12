@@ -10,12 +10,25 @@ import {
   closestCorners,
   DndContext,
   PointerSensor,
+  defaultDropAnimation,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DropAnimation,
 } from "@dnd-kit/core";
-import type { Todo } from "../services/api";
-import { createTodo, fetchTodos, updateTodoStatus } from "../services/api";
+import { useRouter } from "next/router";
+
+import type { ApiError, Todo } from "../services/api";
+import {
+  createTodo,
+  fetchTodos,
+  updateTodoStatus,
+  updateTodoStatusesBatch,
+  getAuthToken,
+  API_URL,
+  updateTodo,
+  deleteTodo,
+} from "../services/api";
 import type { TodoFormValues } from "../components/TodoItem";
 import KanbanColumn from "../components/KanbanColumn";
 import DraggableTodoCard from "../components/DraggableTodoCard";
@@ -27,6 +40,7 @@ import {
   type SerializedTodoPayload,
   type OfflineOperation,
 } from "../utils/offlineQueue";
+import { useAuth } from "../context/AuthContext";
 
 interface DeferredPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -48,6 +62,140 @@ const initialRootForm: RootFormState = {
   endDate: "",
   image: null,
 };
+
+const LOCAL_CACHE_KEY = "todo_cached_todos_v1";
+
+const STATUS_COLUMNS: Array<{
+  id: Todo["status"];
+  title: string;
+  accentClass: string;
+}> = [
+  { id: "TODO", title: "Todo", accentClass: "text-gray-500" },
+  { id: "IN_PROGRESS", title: "In Progress", accentClass: "text-yellow-600" },
+  { id: "DONE", title: "Done", accentClass: "text-green-600" },
+];
+
+const cloneTodos = (list: Todo[]): Todo[] =>
+  list.map((todo) => ({
+    ...todo,
+    subtodos: todo.subtodos ? cloneTodos(todo.subtodos) : todo.subtodos,
+  }));
+
+const removeTodoFromTree = (list: Todo[], targetId: number): Todo[] =>
+  list
+    .filter((todo) => todo.id !== targetId)
+    .map((todo) => ({
+      ...todo,
+      subtodos: todo.subtodos
+        ? removeTodoFromTree(todo.subtodos, targetId)
+        : todo.subtodos,
+    }));
+
+const addSubTodoToParent = (
+  list: Todo[],
+  parentId: number,
+  subTodo: Todo
+): Todo[] =>
+  list.map((todo) => {
+    if (todo.id === parentId) {
+      return {
+        ...todo,
+        subtodos: [...(todo.subtodos ?? []), subTodo],
+      };
+    }
+    if (todo.subtodos?.length) {
+      return {
+        ...todo,
+        subtodos: addSubTodoToParent(todo.subtodos, parentId, subTodo),
+      };
+    }
+    return todo;
+  });
+
+const upsertTodoInTree = (list: Todo[], updated: Todo): Todo[] =>
+  list.map((todo) => {
+    if (todo.id === updated.id) {
+      return updated;
+    }
+    if (todo.subtodos?.length) {
+      return {
+        ...todo,
+        subtodos: upsertTodoInTree(todo.subtodos, updated),
+      };
+    }
+    return todo;
+  });
+
+const applyStatusToList = (
+  list: Todo[],
+  targetId: number,
+  status: Todo["status"]
+): Todo[] =>
+  list.map((todo) => {
+    if (todo.id === targetId) {
+      const subtodos =
+        status === "DONE"
+          ? todo.subtodos?.map((sub) => ({
+              ...sub,
+              status: "DONE",
+            }))
+          : todo.subtodos;
+      return {
+        ...todo,
+        status,
+        subtodos,
+      };
+    }
+
+    if (todo.subtodos?.some((sub) => sub.id === targetId)) {
+      return {
+        ...todo,
+        subtodos: todo.subtodos.map((sub) =>
+          sub.id === targetId
+            ? {
+                ...sub,
+                status,
+              }
+            : sub
+        ),
+      };
+    }
+
+    return todo;
+  });
+
+const applyMetaToList = (
+  list: Todo[],
+  targetId: number,
+  updates: Partial<
+    Pick<Todo, "title" | "description" | "startDate" | "endDate">
+  >
+): Todo[] =>
+  list.map((todo) => {
+    if (todo.id === targetId) {
+      return { ...todo, ...updates };
+    }
+    if (todo.subtodos?.length) {
+      return {
+        ...todo,
+        subtodos: applyMetaToList(todo.subtodos, targetId, updates),
+      };
+    }
+    return todo;
+  });
+
+const STATUS_QUEUE_STORAGE_KEY = "todo_status_queue_v1";
+
+interface StatusUpdateRequest {
+  todoId: number;
+  status: Todo["status"];
+  snapshot: Todo[];
+}
+
+const isOfflineError = (error: unknown) =>
+  typeof window !== "undefined" &&
+  (!navigator.onLine ||
+    (error instanceof TypeError && error.message === "Failed to fetch"));
 
 const buildFormData = (values: TodoFormValues, parentId?: number): FormData => {
   const form = new FormData();
@@ -87,44 +235,23 @@ const buildFormData = (values: TodoFormValues, parentId?: number): FormData => {
   return form;
 };
 
-const STATUS_COLUMNS: Array<{
-  id: Todo["status"];
-  title: string;
-  accentClass: string;
-}> = [
-  {
-    id: "TODO",
-    title: "Todo",
-    accentClass: "text-gray-500",
-  },
-  {
-    id: "IN_PROGRESS",
-    title: "In Progress",
-    accentClass: "text-yellow-600",
-  },
-  {
-    id: "DONE",
-    title: "Done",
-    accentClass: "text-green-600",
-  },
-];
-
-const LOCAL_CACHE_KEY = "todo_cached_todos_v1";
-
 const normalizeTodo = (input: any): Todo => {
   const normalized: Todo = {
-    id: input.id,
-    title: input.title,
+    id: typeof input.id === "number" ? input.id : Number(input.id),
+    title: input.title ?? "Untitled",
     description:
-      typeof input.description === "string" ? input.description : null,
-    imageUrl:
-      typeof input.imageUrl === "string" || input.imageUrl === null
-        ? input.imageUrl
+      typeof input.description === "string" &&
+      input.description.trim().length > 0
+        ? input.description
         : null,
-    startDate: typeof input.startDate === "string" ? input.startDate : null,
-    endDate: typeof input.endDate === "string" ? input.endDate : null,
-    status: (input.status ?? "TODO") as Todo["status"],
-    parentId: typeof input.parentId === "number" ? input.parentId : null,
+    status: (input.status as Todo["status"]) ?? "TODO",
+    parentId:
+      typeof input.parentId === "number"
+        ? input.parentId
+        : input.parentId ?? null,
+    imageUrl: input.imageUrl ?? undefined,
+    startDate: input.startDate ?? undefined,
+    endDate: input.endDate ?? undefined,
     createdAt:
       typeof input.createdAt === "string"
         ? input.createdAt
@@ -133,19 +260,45 @@ const normalizeTodo = (input: any): Todo => {
       typeof input.updatedAt === "string"
         ? input.updatedAt
         : new Date().toISOString(),
-    subtodos: undefined,
-    pendingSync: false,
+    subtodos: Array.isArray(input.subtodos)
+      ? input.subtodos.map((sub: any) => normalizeTodo(sub))
+      : [],
+    timeline: Array.isArray(input.timeline)
+      ? input.timeline.map((event: any) => ({
+          id: event.id,
+          type: event.type,
+          message: event.message,
+          actorUserId:
+            typeof event.actorUserId === "number"
+              ? event.actorUserId
+              : event.actorUserId ?? null,
+          createdAt:
+            typeof event.createdAt === "string"
+              ? event.createdAt
+              : new Date(event.createdAt).toISOString(),
+        }))
+      : [],
   };
-
-  if (Array.isArray(input.subtodos)) {
-    normalized.subtodos = input.subtodos.map((sub: any) => normalizeTodo(sub));
-  }
 
   return normalized;
 };
 
+const normalizeDateInput = (value: string | null): string | null => {
+  if (!value) {
+    return null;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
 export default function HomePage() {
+  const router = useRouter();
+  const { isAuthenticated, isLoading: isAuthLoading, user, logout } = useAuth();
+
   const [todos, setTodos] = useState<Todo[]>([]);
+  const todosRef = useRef<Todo[]>([]);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const hasRestoredStatusQueueRef = useRef(false);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [formState, setFormState] = useState<RootFormState>(initialRootForm);
@@ -153,16 +306,17 @@ export default function HomePage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedTodoId, setSelectedTodoId] = useState<number | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+
   const [installPromptEvent, setInstallPromptEvent] =
     useState<DeferredPromptEvent | null>(null);
   const [isInstallAvailable, setIsInstallAvailable] = useState(false);
   const [installMessage, setInstallMessage] = useState<string | null>(null);
-  const bodyOverflowRef = useRef<string | null>(null);
-  const bodyTouchActionRef = useRef<string | null>(null);
-  const bodyPositionRef = useRef<string | null>(null);
-  const bodyTopRef = useRef<string | null>(null);
-  const bodyWidthRef = useRef<string | null>(null);
-  const scrollYRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (!isAuthLoading && !isAuthenticated) {
+      void router.replace("/login");
+    }
+  }, [isAuthLoading, isAuthenticated, router]);
 
   const persistTodos = useCallback((list: Todo[]) => {
     if (typeof window === "undefined") return;
@@ -180,86 +334,96 @@ export default function HomePage() {
     [persistTodos]
   );
 
-  const applyLocalStatusChange = useCallback(
-    (targetId: number, status: Todo["status"], markPending: boolean) => {
-      updateTodosState((prev) =>
-        prev.map((todo) => {
-          if (todo.id === targetId) {
-            const subtodos =
-              status === "DONE"
-                ? todo.subtodos?.map((sub) => ({
-                    ...sub,
-                    status: "DONE",
-                    pendingSync: markPending ? true : sub.pendingSync,
-                  }))
-                : todo.subtodos;
-            return {
-              ...todo,
-              status,
-              pendingSync: markPending ? true : todo.pendingSync,
-              subtodos,
-            };
-          }
+  const loadTodos = useCallback(async () => {
+    if (!isAuthenticated) return;
+    setIsLoading(true);
+    try {
+      const data = await fetchTodos();
+      const normalised = data.map((todo) => normalizeTodo(todo));
+      setTodos(normalised as Todo[]);
+      persistTodos(normalised as Todo[]);
+      setError(null);
+    } catch (err) {
+      const apiError = err as ApiError;
+      if (apiError?.status === 401) {
+        logout();
+        await router.replace("/login");
+        return;
+      }
 
-          if (todo.subtodos?.some((sub) => sub.id === targetId)) {
-            return {
-              ...todo,
-              subtodos: todo.subtodos.map((sub) =>
-                sub.id === targetId
-                  ? {
-                      ...sub,
-                      status,
-                      pendingSync: markPending ? true : sub.pendingSync,
-                    }
-                  : sub
-              ),
-            };
-          }
-
-          return todo;
-        })
-      );
-    },
-    [updateTodosState]
-  );
-
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
-  );
-
-  const lockBodyScroll = useCallback(() => {
-    if (typeof document === "undefined") return;
-    if (bodyOverflowRef.current === null) {
-      scrollYRef.current = window.scrollY || 0;
-      bodyOverflowRef.current = document.body.style.overflow;
-      bodyTouchActionRef.current = document.body.style.touchAction;
-      bodyPositionRef.current = document.body.style.position;
-      bodyTopRef.current = document.body.style.top;
-      bodyWidthRef.current = document.body.style.width;
-      document.body.style.overflow = "hidden";
-      document.body.style.touchAction = "none";
-      document.body.style.position = "fixed";
-      document.body.style.top = `-${scrollYRef.current}px`;
-      document.body.style.width = "100%";
+      const cached =
+        typeof window !== "undefined"
+          ? window.localStorage.getItem(LOCAL_CACHE_KEY)
+          : null;
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached) as Todo[];
+          setTodos(parsed);
+          setError("Offline mode: showing cached todos.");
+        } catch {
+          setError(err instanceof Error ? err.message : "Failed to load todos");
+        }
+      } else {
+        setError(err instanceof Error ? err.message : "Failed to load todos");
+      }
+    } finally {
+      setIsLoading(false);
     }
-  }, []);
+  }, [isAuthenticated, persistTodos, logout, router]);
 
-  const releaseBodyScroll = useCallback(() => {
-    if (typeof document === "undefined") return;
-    if (bodyOverflowRef.current !== null) {
-      document.body.style.overflow = bodyOverflowRef.current || "";
-      document.body.style.touchAction = bodyTouchActionRef.current || "";
-      document.body.style.position = bodyPositionRef.current || "";
-      document.body.style.top = bodyTopRef.current || "";
-      document.body.style.width = bodyWidthRef.current || "";
-      window.scrollTo(0, scrollYRef.current || 0);
-      bodyOverflowRef.current = null;
-      bodyTouchActionRef.current = null;
-      bodyPositionRef.current = null;
-      bodyTopRef.current = null;
-      bodyWidthRef.current = null;
+  const flushOfflineQueue = useCallback(async () => {
+    if (!isAuthenticated) return;
+    if (typeof window === "undefined" || !navigator.onLine) return;
+    const operations = consumeQueue();
+    if (!operations.length) return;
+
+    let hasProcessed = false;
+    const remaining: OfflineOperation[] = [];
+
+    for (let index = 0; index < operations.length; index++) {
+      const operation = operations[index];
+      try {
+        if (operation.type === "createTodo") {
+          const formData = buildFormData(
+            operation.payload.values,
+            operation.payload.parentId ?? undefined
+          );
+          await createTodo(formData);
+        } else if (operation.type === "updateStatus") {
+          await updateTodoStatus(
+            operation.payload.id,
+            operation.payload.status
+          );
+        }
+        hasProcessed = true;
+      } catch (err) {
+        remaining.push(operation, ...operations.slice(index + 1));
+        break;
+      }
     }
-  }, []);
+
+    pushBackQueue(remaining);
+    if (hasProcessed) {
+      await loadTodos();
+    }
+  }, [isAuthenticated, loadTodos]);
+
+  useEffect(() => {
+    void loadTodos();
+  }, [loadTodos]);
+
+  useEffect(() => {
+    void flushOfflineQueue();
+    if (typeof window === "undefined") return;
+    const onlineHandler = () => {
+      void flushOfflineQueue();
+    };
+    window.addEventListener("online", onlineHandler);
+    return () => {
+      window.removeEventListener("online", onlineHandler);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    };
+  }, [flushOfflineQueue]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -285,172 +449,194 @@ export default function HomePage() {
     return () => {
       window.removeEventListener("beforeinstallprompt", handleBeforeInstall);
       window.removeEventListener("appinstalled", handleAppInstalled);
-      releaseBodyScroll();
     };
-  }, [releaseBodyScroll]);
+  }, []);
 
-  const loadTodos = useCallback(async () => {
-    setIsLoading(true);
+  const handleInstallPwa = useCallback(async () => {
+    if (!installPromptEvent) return;
     try {
-      const data = await fetchTodos();
-      const normalised = data.map((todo) => normalizeTodo(todo));
-      setTodos(normalised as unknown as Todo[]);
-      persistTodos(normalised as unknown as Todo[]);
-      setError(null);
-    } catch (err) {
-      const cached =
-        typeof window !== "undefined"
-          ? window.localStorage.getItem(LOCAL_CACHE_KEY)
-          : null;
-      if (cached) {
-        try {
-          const parsed = JSON.parse(cached) as Todo[];
-          setTodos(parsed);
-          setError("Offline mode: showing the last synced board.");
-        } catch (parseError) {
-          setError(err instanceof Error ? err.message : "Failed to load todos");
-        }
-      } else {
-        setError(err instanceof Error ? err.message : "Failed to load todos");
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  }, [persistTodos]);
-
-  const handleCreateSubTodo = useCallback(
-    async (parent: Todo, values: { title: string; description?: string }) => {
-      if (parent.pendingSync) {
-        setError(
-          "Please wait for the parent todo to sync before adding subtodos."
+      setInstallMessage(null);
+      await installPromptEvent.prompt();
+      const choice = await installPromptEvent.userChoice;
+      setInstallPromptEvent(null);
+      setIsInstallAvailable(false);
+      if (choice.outcome === "accepted") {
+        setInstallMessage(
+          "Install started. Check your device to finish adding the app."
         );
-        return;
+      } else {
+        setInstallMessage("Install dismissed. You can try again later.");
       }
+    } catch {
+      setInstallMessage("Install prompt failed. Please try again later.");
+      setInstallPromptEvent(null);
+      setIsInstallAvailable(false);
+    }
+  }, [installPromptEvent]);
 
-      const payloadValues: SerializedTodoPayload = {
-        title: values.title.trim(),
-        description: values.description?.trim()
-          ? values.description.trim()
-          : null,
-        status: "TODO",
-      };
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+  );
+  useEffect(() => {
+    todosRef.current = cloneTodos(todos);
+  }, [todos]);
 
-      try {
-        const formData = buildFormData(payloadValues, parent.id);
-        await createTodo(formData);
-        await loadTodos();
-      } catch (err) {
-        const offline =
-          typeof navigator !== "undefined" &&
-          (!navigator.onLine ||
-            (err instanceof TypeError && err.message === "Failed to fetch"));
-        if (offline) {
-          enqueueOperation({
-            type: "createTodo",
-            payload: { values: payloadValues, parentId: parent.id },
-          });
-
-          const tempId = Date.now() * -1;
-          const timestamp = new Date().toISOString();
-          const optimisticSubTodo: Todo = {
-            id: tempId,
-            title: payloadValues.title,
-            description: payloadValues.description ?? null,
-            status: "TODO",
-            parentId: parent.id,
-            imageUrl: undefined,
-            startDate: undefined,
-            endDate: undefined,
-            createdAt: timestamp,
-            updatedAt: timestamp,
-            subtodos: undefined,
-            pendingSync: true,
-          };
-
-          updateTodosState((prev) =>
-            prev.map((todo) =>
-              todo.id === parent.id
-                ? {
-                    ...todo,
-                    subtodos: [...(todo.subtodos ?? []), optimisticSubTodo],
-                  }
-                : todo
-            )
-          );
-
-          setError("Offline mode: subtodo will sync when you're back online.");
-        } else {
-          setError(
-            err instanceof Error ? err.message : "Failed to create subtodo"
-          );
-        }
-      }
-    },
-    [loadTodos, updateTodosState]
+  const dropAnimation = useMemo<DropAnimation>(
+    () => ({
+      ...defaultDropAnimation,
+      duration: 250,
+      easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+    }),
+    []
   );
 
-  useEffect(() => {
-    void loadTodos();
-  }, [loadTodos]);
+  const statusQueueRef = useRef<StatusUpdateRequest[]>([]);
 
-  const flushOfflineQueue = useCallback(async () => {
+  const persistStatusQueue = useCallback(() => {
     if (typeof window === "undefined") return;
-    if (!navigator.onLine) return;
-    const operations = consumeQueue();
-    if (!operations.length) return;
-    let hasProcessed = false;
-    const remaining: OfflineOperation[] = [];
-
-    for (let index = 0; index < operations.length; index++) {
-      const operation = operations[index];
-      try {
-        if (operation.type === "createTodo") {
-          const formData = new FormData();
-          const { values, parentId } = operation.payload;
-          formData.append("title", values.title);
-          if (values.description) {
-            formData.append("description", values.description);
-          }
-          if (values.startDate) {
-            formData.append("startDate", values.startDate);
-          }
-          if (values.endDate) {
-            formData.append("endDate", values.endDate);
-          }
-          formData.append("status", values.status ?? "TODO");
-          if (typeof parentId === "number") {
-            formData.append("parentId", String(parentId));
-          }
-          await createTodo(formData);
-        } else if (operation.type === "updateStatus") {
-          await updateTodoStatus(
-            operation.payload.id,
-            operation.payload.status
-          );
-        }
-        hasProcessed = true;
-      } catch (error) {
-        remaining.push(operation, ...operations.slice(index + 1));
-        break;
-      }
-    }
-
-    pushBackQueue(remaining);
-    if (hasProcessed) {
-      await loadTodos();
-    }
-  }, [loadTodos]);
+    const serialized = statusQueueRef.current.map(({ todoId, status }) => ({
+      todoId,
+      status,
+    }));
+    window.localStorage.setItem(
+      STATUS_QUEUE_STORAGE_KEY,
+      JSON.stringify(serialized)
+    );
+  }, []);
 
   useEffect(() => {
-    void flushOfflineQueue();
-    const onlineHandler = () => {
-      void flushOfflineQueue();
+    if (typeof window === "undefined") return;
+    if (!isAuthenticated || isLoading) return;
+    if (hasRestoredStatusQueueRef.current) return;
+
+    hasRestoredStatusQueueRef.current = true;
+
+    try {
+      const raw = window.localStorage.getItem(STATUS_QUEUE_STORAGE_KEY);
+      if (!raw) return;
+      const stored = JSON.parse(raw) as Array<{
+        todoId: number;
+        status: Todo["status"];
+      }>;
+      if (!Array.isArray(stored) || stored.length === 0) return;
+
+      let working = cloneTodos(todosRef.current);
+      const rebuiltQueue: StatusUpdateRequest[] = [];
+
+      stored.forEach(({ todoId, status }) => {
+        rebuiltQueue.push({
+          todoId,
+          status,
+          snapshot: cloneTodos(working),
+        });
+        working = applyStatusToList(working, todoId, status);
+      });
+
+      statusQueueRef.current = rebuiltQueue;
+      updateTodosState(() => working);
+    } catch {
+      window.localStorage.removeItem(STATUS_QUEUE_STORAGE_KEY);
+    }
+  }, [isAuthenticated, isLoading, updateTodosState]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !isAuthenticated) {
+      return;
+    }
+
+    const token = getAuthToken();
+    if (!token) {
+      return;
+    }
+
+    let stopped = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      if (stopped) return;
+
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+
+      const streamUrl = new URL("/api/todos/stream", API_URL);
+      streamUrl.searchParams.set("token", token);
+      const source = new EventSource(streamUrl.toString());
+      eventSourceRef.current = source;
+
+      source.onmessage = (event) => {
+        if (!event.data) return;
+        try {
+          const payload = JSON.parse(event.data) as {
+            type?: string;
+            userId?: number;
+            todos?: any[];
+            removedIds?: number[];
+          };
+
+          if (!payload || payload.userId !== user?.id) {
+            return;
+          }
+
+          switch (payload.type) {
+            case "create":
+            case "update":
+            case "status_single":
+            case "status_batch":
+              if (Array.isArray(payload.todos)) {
+                const normalized = payload.todos.map((todo) =>
+                  normalizeTodo(todo)
+                );
+                updateTodosState((prev) => {
+                  let next = cloneTodos(prev);
+                  for (const todo of normalized) {
+                    next = upsertTodoInTree(next, todo);
+                  }
+                  return next;
+                });
+              }
+              break;
+            case "delete":
+              if (Array.isArray(payload.removedIds)) {
+                updateTodosState((prev) => {
+                  let next = cloneTodos(prev);
+                  for (const id of payload.removedIds ?? []) {
+                    next = removeTodoFromTree(next, id);
+                  }
+                  return next;
+                });
+              }
+              break;
+            default:
+              break;
+          }
+        } catch {
+          // ignore malformed payloads
+        }
+      };
+
+      source.onerror = () => {
+        source.close();
+        if (!stopped) {
+          retryTimer = setTimeout(connect, 3000);
+        }
+      };
     };
-    window.addEventListener("online", onlineHandler);
+
+    connect();
+
     return () => {
-      window.removeEventListener("online", onlineHandler);
+      stopped = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+      }
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
     };
-  }, [flushOfflineQueue]);
+  }, [isAuthenticated, updateTodosState, user?.id]);
 
   const handleCreateTodo = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -461,43 +647,65 @@ export default function HomePage() {
 
     setIsSubmitting(true);
     setFormError(null);
+
+    const values: TodoFormValues = {
+      title: formState.title.trim(),
+      description: formState.description.trim()
+        ? formState.description.trim()
+        : null,
+      startDate: formState.startDate || null,
+      endDate: formState.endDate || null,
+      image: formState.image,
+      clearStartDate: formState.startDate === "",
+      clearEndDate: formState.endDate === "",
+    };
+
+    const tempId = Date.now() * -1;
+    const timestamp = new Date().toISOString();
+    const optimisticTodo: Todo = {
+      id: tempId,
+      title: values.title,
+      description: values.description ?? null,
+      startDate: values.startDate ?? undefined,
+      endDate: values.endDate ?? undefined,
+      status: values.status ?? "TODO",
+      parentId: null,
+      imageUrl: undefined,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      subtodos: [],
+      timeline: [],
+    };
+
+    updateTodosState((prev) => [optimisticTodo, ...prev]);
+
+    const formData = buildFormData(values);
+
     try {
-      const values: TodoFormValues = {
-        title: formState.title.trim(),
-        description: formState.description.trim()
-          ? formState.description.trim()
-          : null,
-        startDate: formState.startDate || null,
-        endDate: formState.endDate || null,
-        image: formState.image,
-        clearStartDate: formState.startDate === "",
-        clearEndDate: formState.endDate === "",
-      };
-      const formData = buildFormData(values);
-      await createTodo(formData);
+      const created = await createTodo(formData);
+      const normalized = normalizeTodo(created);
+      updateTodosState((prev) => {
+        const trimmed = removeTodoFromTree(prev, tempId);
+        return [normalized, ...trimmed];
+      });
       setFormState(initialRootForm);
       setFormError(null);
-      await loadTodos();
       setShowCreateModal(false);
+      void loadTodos();
     } catch (err) {
-      const offline =
-        typeof navigator !== "undefined" &&
-        (!navigator.onLine ||
-          (err instanceof TypeError && err.message === "Failed to fetch"));
-      if (offline) {
+      if (isOfflineError(err)) {
         if (formState.image) {
+          updateTodosState((prev) => removeTodoFromTree(prev, tempId));
           setFormError("Image uploads require an internet connection.");
           setIsSubmitting(false);
           return;
         }
 
         const payloadValues: SerializedTodoPayload = {
-          title: formState.title.trim(),
-          description: formState.description.trim()
-            ? formState.description.trim()
-            : null,
-          startDate: formState.startDate || null,
-          endDate: formState.endDate || null,
+          title: values.title,
+          description: values.description,
+          startDate: values.startDate,
+          endDate: values.endDate,
           status: "TODO",
         };
 
@@ -506,29 +714,12 @@ export default function HomePage() {
           payload: { values: payloadValues, parentId: null },
         });
 
-        const tempId = Date.now() * -1;
-        const timestamp = new Date().toISOString();
-        const optimisticTodo: Todo = {
-          id: tempId,
-          title: payloadValues.title,
-          description: payloadValues.description ?? null,
-          startDate: payloadValues.startDate ?? undefined,
-          endDate: payloadValues.endDate ?? undefined,
-          status: "TODO",
-          parentId: null,
-          imageUrl: undefined,
-          createdAt: timestamp,
-          updatedAt: timestamp,
-          subtodos: [] as Todo[],
-          pendingSync: true,
-        };
-
-        updateTodosState((prev) => [optimisticTodo, ...prev]);
         setFormState(initialRootForm);
         setFormError(null);
         setShowCreateModal(false);
         setError("Offline mode: todo will sync when you're back online.");
       } else {
+        updateTodosState((prev) => removeTodoFromTree(prev, tempId));
         setFormError(
           err instanceof Error ? err.message : "Failed to create todo"
         );
@@ -538,11 +729,143 @@ export default function HomePage() {
     }
   };
 
+  const handleCreateSubTodo = useCallback(
+    async (parent: Todo, values: { title: string; description?: string }) => {
+      const payloadValues: SerializedTodoPayload = {
+        title: values.title.trim(),
+        description: values.description?.trim()
+          ? values.description.trim()
+          : null,
+        status: "TODO",
+      };
+
+      const tempId = Date.now() * -1;
+      const timestamp = new Date().toISOString();
+      const optimisticSubTodo: Todo = {
+        id: tempId,
+        title: payloadValues.title,
+        description: payloadValues.description ?? null,
+        startDate: undefined,
+        endDate: undefined,
+        status: "TODO",
+        parentId: parent.id,
+        imageUrl: undefined,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        subtodos: [],
+        timeline: [],
+      };
+
+      updateTodosState((prev) =>
+        addSubTodoToParent(prev, parent.id, optimisticSubTodo)
+      );
+
+      try {
+        const formData = buildFormData(payloadValues, parent.id);
+        const created = await createTodo(formData);
+        const normalized = normalizeTodo(created);
+        updateTodosState((prev) => {
+          const trimmed = removeTodoFromTree(prev, tempId);
+          if (normalized.parentId) {
+            return addSubTodoToParent(trimmed, normalized.parentId, normalized);
+          }
+          return [normalized, ...trimmed];
+        });
+        void loadTodos();
+      } catch (err) {
+        if (isOfflineError(err)) {
+          enqueueOperation({
+            type: "createTodo",
+            payload: { values: payloadValues, parentId: parent.id },
+          });
+          setError("Offline mode: subtodo will sync when you're back online.");
+        } else {
+          updateTodosState((prev) => removeTodoFromTree(prev, tempId));
+          setError(
+            err instanceof Error ? err.message : "Failed to create subtodo"
+          );
+        }
+      }
+    },
+    [loadTodos, updateTodosState]
+  );
+
+  const applyLocalStatusChange = useCallback(
+    (targetId: number, status: Todo["status"]) => {
+      updateTodosState((prev) => applyStatusToList(prev, targetId, status));
+    },
+    [updateTodosState]
+  );
+
+  const enqueueStatusUpdate = useCallback(
+    (todoId: number, status: Todo["status"], snapshot: Todo[]) => {
+      const existing = statusQueueRef.current.find(
+        (item) => item.todoId === todoId
+      );
+      const snapshotToStore = existing ? existing.snapshot : snapshot;
+      statusQueueRef.current = statusQueueRef.current.filter(
+        (item) => item.todoId !== todoId
+      );
+      statusQueueRef.current.push({
+        todoId,
+        status,
+        snapshot: snapshotToStore,
+      });
+      persistStatusQueue();
+    },
+    [persistStatusQueue]
+  );
+
+  const flushPendingStatusQueue = useCallback(
+    async ({ keepalive = false }: { keepalive?: boolean } = {}) => {
+      if (statusQueueRef.current.length === 0) {
+        return true;
+      }
+
+      const payload = statusQueueRef.current.map(({ todoId, status }) => ({
+        id: todoId,
+        status,
+      }));
+
+      try {
+        await updateTodoStatusesBatch(payload, { keepalive });
+        const ids = payload.map((item) => item.id);
+        statusQueueRef.current = [];
+        persistStatusQueue();
+        updateTodosState((prev) =>
+          ids.reduce((acc, id) => applyStatusToList(acc, id, "TODO"), prev)
+        );
+        if (!keepalive) {
+          setError(null);
+        }
+        return true;
+      } catch (err) {
+        if (!keepalive) {
+          const apiError = err as ApiError;
+          if (apiError?.status === 401) {
+            statusQueueRef.current = [];
+            persistStatusQueue();
+            await logout();
+            await router.replace("/login");
+          } else {
+            setError(
+              err instanceof Error
+                ? err.message
+                : "Failed to sync pending status updates"
+            );
+          }
+        }
+        return false;
+      }
+    },
+    [logout, persistStatusQueue, router, updateTodosState]
+  );
+
   const handleUpdateStatus = useCallback(
     async (todo: Todo, status: Todo["status"]) => {
       if (todo.status === status) return;
 
-      if (todo.pendingSync || todo.id < 0) {
+      if (todo.id < 0) {
         setError(
           "Please wait for this todo to sync before updating its status."
         );
@@ -550,30 +873,185 @@ export default function HomePage() {
       }
 
       setError(null);
-      const offline = typeof navigator !== "undefined" && !navigator.onLine;
+      const snapshot = cloneTodos(todosRef.current);
+      applyLocalStatusChange(todo.id, status);
+      enqueueStatusUpdate(todo.id, status, snapshot);
 
+      const offline = typeof navigator !== "undefined" && !navigator.onLine;
       if (offline) {
-        applyLocalStatusChange(todo.id, status, true);
         enqueueOperation({
           type: "updateStatus",
           payload: { id: todo.id, status },
         });
         setError("Offline mode: status change queued for sync.");
-        return;
       }
+    },
+    [applyLocalStatusChange, enqueueStatusUpdate]
+  );
 
+  const handleDeleteTodo = useCallback(
+    async (target: Todo) => {
+      const snapshot = cloneTodos(todosRef.current);
+      statusQueueRef.current = statusQueueRef.current.filter(
+        (item) => item.todoId !== target.id
+      );
+      persistStatusQueue();
+      updateTodosState((prev) => removeTodoFromTree(prev, target.id));
       try {
-        await updateTodoStatus(todo.id, status);
-        await loadTodos();
+        await deleteTodo(target.id);
+        setError(null);
+        setSelectedTodoId((current) =>
+          current === target.id ? null : current
+        );
       } catch (err) {
+        updateTodosState(() => snapshot);
         const message =
-          err instanceof Error ? err.message : "Failed to update todo status";
+          err instanceof Error ? err.message : "Failed to delete todo";
         setError(message);
         throw err instanceof Error ? err : new Error(message);
       }
     },
-    [applyLocalStatusChange, loadTodos]
+    [deleteTodo, persistStatusQueue, updateTodosState]
   );
+
+  const handleDeleteSubTodo = useCallback(
+    async (subTodo: Todo) => {
+      const snapshot = cloneTodos(todosRef.current);
+      statusQueueRef.current = statusQueueRef.current.filter(
+        (item) => item.todoId !== subTodo.id
+      );
+      persistStatusQueue();
+      updateTodosState((prev) => removeTodoFromTree(prev, subTodo.id));
+      try {
+        await deleteTodo(subTodo.id);
+        setError(null);
+      } catch (err) {
+        updateTodosState(() => snapshot);
+        const message =
+          err instanceof Error ? err.message : "Failed to delete subtodo";
+        setError(message);
+        throw err instanceof Error ? err : new Error(message);
+      }
+    },
+    [deleteTodo, persistStatusQueue, updateTodosState]
+  );
+
+  const handleUpdateDetails = useCallback(
+    async (
+      target: Todo,
+      values: { title: string; description: string | null }
+    ) => {
+      const snapshot = cloneTodos(todosRef.current);
+      updateTodosState((prev) =>
+        applyMetaToList(prev, target.id, {
+          title: values.title,
+          description: values.description,
+        })
+      );
+
+      try {
+        const updated = await updateTodo(target.id, {
+          title: values.title,
+          description: values.description,
+        });
+        const normalized = normalizeTodo(updated);
+        updateTodosState((prev) => upsertTodoInTree(prev, normalized));
+        setError(null);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to update todo";
+        setError(message);
+        updateTodosState(() => snapshot);
+        throw err instanceof Error ? err : new Error(message);
+      }
+    },
+    [setError, updateTodo, updateTodosState]
+  );
+
+  const handleUpdateTimeline = useCallback(
+    async (
+      target: Todo,
+      values: { startDate: string | null; endDate: string | null }
+    ) => {
+      const snapshot = cloneTodos(todosRef.current);
+      const payload = {
+        startDate: normalizeDateInput(values.startDate),
+        endDate: normalizeDateInput(values.endDate),
+      };
+
+      updateTodosState((prev) =>
+        applyMetaToList(prev, target.id, {
+          startDate: normalizeDateInput(values.startDate),
+          endDate: normalizeDateInput(values.endDate),
+        })
+      );
+
+      try {
+        const updated = await updateTodo(target.id, payload);
+        const normalized = normalizeTodo(updated);
+        updateTodosState((prev) => upsertTodoInTree(prev, normalized));
+        setError(null);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to update timeline";
+        setError(message);
+        updateTodosState(() => snapshot);
+        throw err instanceof Error ? err : new Error(message);
+      }
+    },
+    [updateTodo, updateTodosState]
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handlePageHide = () => {
+      if (statusQueueRef.current.length === 0) return;
+      void flushPendingStatusQueue({ keepalive: true });
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        handlePageHide();
+      }
+    };
+
+    window.addEventListener("beforeunload", handlePageHide);
+    window.addEventListener("pagehide", handlePageHide);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener("beforeunload", handlePageHide);
+      window.removeEventListener("pagehide", handlePageHide);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [flushPendingStatusQueue]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleOnline = () => {
+      void flushPendingStatusQueue();
+    };
+
+    window.addEventListener("online", handleOnline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [flushPendingStatusQueue]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleOnline = () => {
+      void flushPendingStatusQueue();
+    };
+
+    window.addEventListener("online", handleOnline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [flushPendingStatusQueue]);
 
   const handleToggleSubTodo = useCallback(
     async (subTodo: Todo, completed: boolean) => {
@@ -583,9 +1061,18 @@ export default function HomePage() {
     [handleUpdateStatus]
   );
 
+  useEffect(
+    () => () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    },
+    []
+  );
+
   const handleDragEnd = useCallback(
     async (event: DragEndEvent) => {
-      releaseBodyScroll();
       const { active, over } = event;
       if (!over) return;
 
@@ -599,19 +1086,11 @@ export default function HomePage() {
       try {
         await handleUpdateStatus(todo, newStatus);
       } catch {
-        // error already handled and displayed via handleUpdateStatus
+        // Already handled in handleUpdateStatus
       }
     },
-    [handleUpdateStatus, releaseBodyScroll]
+    [handleUpdateStatus]
   );
-
-  const handleDragStart = useCallback(() => {
-    lockBodyScroll();
-  }, [lockBodyScroll]);
-
-  const handleDragCancel = useCallback(() => {
-    releaseBodyScroll();
-  }, [releaseBodyScroll]);
 
   const groupedTodos = useMemo(() => {
     const groups: Record<Todo["status"], Todo[]> = {
@@ -637,63 +1116,61 @@ export default function HomePage() {
   const heading = useMemo(() => {
     if (isLoading) return "Loading your board...";
     if (todos.length === 0) return "Start planning with your first todo";
-    return "Todo List";
+    return "Todo Board";
   }, [isLoading, todos.length]);
 
-  const handleViewDetails = useCallback((todo: Todo) => {
-    setSelectedTodoId(todo.id);
-  }, []);
+  if (isAuthLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-100 text-sm text-gray-500">
+        Loading your workspace...
+      </div>
+    );
+  }
 
-  const handleCloseModal = useCallback(() => {
-    setSelectedTodoId(null);
-  }, []);
-
-  const handleInstallPwa = useCallback(async () => {
-    if (!installPromptEvent) return;
-    try {
-      setInstallMessage(null);
-      await installPromptEvent.prompt();
-      const choice = await installPromptEvent.userChoice;
-      setInstallPromptEvent(null);
-      setIsInstallAvailable(false);
-      if (choice.outcome === "accepted") {
-        setInstallMessage(
-          "Install started. Check your device to finish adding the app."
-        );
-      } else {
-        setInstallMessage("Install dismissed. You can try again later.");
-      }
-    } catch (err) {
-      setInstallMessage("Install prompt failed. Please try again later.");
-      setInstallPromptEvent(null);
-      setIsInstallAvailable(false);
-    }
-  }, [installPromptEvent]);
+  if (!isAuthenticated) {
+    return null;
+  }
 
   return (
     <div className="min-h-screen bg-gray-100">
       <div className="mx-auto max-w-6xl px-4 py-8">
-        <header className="mb-8 text-center">
-          <h1 className="text-3xl font-bold text-gray-900 md:text-4xl">
-            {heading}
-          </h1>
-          <p className="mt-2 text-gray-600">
-            Quản lý và note những điều cần làm
-          </p>
-          {isInstallAvailable && (
-            <div className="mt-4 flex justify-center">
+        <nav className="mb-6 flex items-center justify-between rounded-2xl bg-white/80 px-6 py-4 shadow">
+          <div>
+            <p className="text-xs uppercase tracking-widest text-brand-500">
+              Todo App
+            </p>
+            <h1 className="text-lg font-semibold text-gray-900">
+              Hello, {user?.name || user?.email}
+            </h1>
+          </div>
+          <div className="flex items-center gap-3">
+            {isInstallAvailable && (
               <button
                 type="button"
                 onClick={handleInstallPwa}
-                className="inline-flex items-center gap-2 rounded-full bg-brand-500 px-5 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-brand-500/90"
+                className="rounded-full bg-brand-500 px-4 py-2 text-xs font-semibold text-white shadow transition hover:bg-brand-500/90"
               >
-                <span role="img" aria-hidden="true">
-                  📲
-                </span>
-                Install this app on your device
+                Install app
               </button>
-            </div>
-          )}
+            )}
+            <button
+              type="button"
+              onClick={() => logout()}
+              className="rounded-full border border-gray-200 px-4 py-2 text-xs font-medium text-gray-600 transition hover:border-brand-500 hover:text-brand-500"
+            >
+              Log out
+            </button>
+          </div>
+        </nav>
+
+        <header className="mb-8 text-center">
+          <h2 className="text-3xl font-bold text-gray-900 md:text-4xl">
+            {heading}
+          </h2>
+          <p className="mt-2 text-gray-600">
+            Organise todos, collaborate with subtasks, and track progress with
+            timelines.
+          </p>
           {installMessage && (
             <p className="mt-3 text-sm text-brand-500">{installMessage}</p>
           )}
@@ -708,9 +1185,7 @@ export default function HomePage() {
         <DndContext
           sensors={sensors}
           collisionDetection={closestCorners}
-          onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
-          onDragCancel={handleDragCancel}
         >
           <div className="grid gap-4 md:grid-cols-3">
             {STATUS_COLUMNS.map((column) => (
@@ -725,7 +1200,7 @@ export default function HomePage() {
                   <button
                     type="button"
                     onClick={() => setShowCreateModal(true)}
-                    className="flex w-full items-center justify-center rounded-xl border border-dashed border-gray-300 bg-white py-10 text-sm font-medium text-gray-500 transition hover:border-brand-500 hover:text-brand-500"
+                    className="flex w-full items-center justify-center rounded-xl border border-dashed border-gray-300 bg-gray-50 py-10 text-sm font-medium text-gray-500 transition hover:border-brand-500 hover:text-brand-500"
                   >
                     + Add new todo
                   </button>
@@ -735,8 +1210,10 @@ export default function HomePage() {
                     key={todo.id}
                     todo={todo}
                     onUpdateStatus={handleUpdateStatus}
-                    onViewDetails={handleViewDetails}
+                    onViewDetails={(item) => setSelectedTodoId(item.id)}
                     onToggleSubTodo={handleToggleSubTodo}
+                    onDeleteTodo={handleDeleteTodo}
+                    onDeleteSubTodo={handleDeleteSubTodo}
                   />
                 ))}
               </KanbanColumn>
@@ -748,10 +1225,14 @@ export default function HomePage() {
       {selectedTodo && (
         <TodoDetailsModal
           todo={selectedTodo}
-          onClose={handleCloseModal}
+          onClose={() => setSelectedTodoId(null)}
           onUpdateStatus={handleUpdateStatus}
           onCreateSubTodo={handleCreateSubTodo}
           onToggleSubTodo={handleToggleSubTodo}
+          onDeleteTodo={handleDeleteTodo}
+          onDeleteSubTodo={handleDeleteSubTodo}
+          onUpdateDetails={handleUpdateDetails}
+          onUpdateTimeline={handleUpdateTimeline}
         />
       )}
 
@@ -770,7 +1251,11 @@ export default function HomePage() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => setShowCreateModal(false)}
+                  onClick={() => {
+                    setShowCreateModal(false);
+                    setFormState(initialRootForm);
+                    setFormError(null);
+                  }}
                   className="rounded-full border border-gray-200 px-3 py-1 text-xs text-gray-500 transition hover:bg-gray-100"
                 >
                   Close
