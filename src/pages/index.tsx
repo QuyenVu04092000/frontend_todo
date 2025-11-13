@@ -312,6 +312,84 @@ export default function HomePage() {
   const [isInstallAvailable, setIsInstallAvailable] = useState(false);
   const [installMessage, setInstallMessage] = useState<string | null>(null);
 
+  const scrollLockRef = useRef<{
+    htmlOverflow: string;
+    htmlTouchAction: string;
+    htmlOverscrollBehavior: string;
+    bodyOverflow: string;
+    bodyTouchAction: string;
+    bodyOverscrollBehavior: string;
+  } | null>(null);
+
+  const lockScrollDuringDrag = useCallback(() => {
+    if (typeof document === "undefined") return;
+    if (scrollLockRef.current) return;
+
+    const html = document.documentElement;
+    const body = document.body;
+
+    scrollLockRef.current = {
+      htmlOverflow: html.style.overflow,
+      htmlTouchAction: html.style.getPropertyValue("touch-action"),
+      htmlOverscrollBehavior: html.style.getPropertyValue(
+        "overscroll-behavior"
+      ),
+      bodyOverflow: body.style.overflow,
+      bodyTouchAction: body.style.getPropertyValue("touch-action"),
+      bodyOverscrollBehavior: body.style.getPropertyValue(
+        "overscroll-behavior"
+      ),
+    };
+
+    html.style.overflow = "hidden";
+    html.style.setProperty("touch-action", "none");
+    html.style.setProperty("overscroll-behavior", "none");
+    body.style.overflow = "hidden";
+    body.style.setProperty("touch-action", "none");
+    body.style.setProperty("overscroll-behavior", "none");
+  }, []);
+
+  const releaseScrollLock = useCallback(() => {
+    if (typeof document === "undefined") return;
+    const previous = scrollLockRef.current;
+    if (!previous) return;
+
+    const html = document.documentElement;
+    const body = document.body;
+
+    html.style.overflow = previous.htmlOverflow;
+    if (previous.htmlTouchAction) {
+      html.style.setProperty("touch-action", previous.htmlTouchAction);
+    } else {
+      html.style.removeProperty("touch-action");
+    }
+    if (previous.htmlOverscrollBehavior) {
+      html.style.setProperty(
+        "overscroll-behavior",
+        previous.htmlOverscrollBehavior
+      );
+    } else {
+      html.style.removeProperty("overscroll-behavior");
+    }
+
+    body.style.overflow = previous.bodyOverflow;
+    if (previous.bodyTouchAction) {
+      body.style.setProperty("touch-action", previous.bodyTouchAction);
+    } else {
+      body.style.removeProperty("touch-action");
+    }
+    if (previous.bodyOverscrollBehavior) {
+      body.style.setProperty(
+        "overscroll-behavior",
+        previous.bodyOverscrollBehavior
+      );
+    } else {
+      body.style.removeProperty("overscroll-behavior");
+    }
+
+    scrollLockRef.current = null;
+  }, []);
+
   useEffect(() => {
     if (!isAuthLoading && !isAuthenticated) {
       void router.replace("/login");
@@ -473,6 +551,12 @@ export default function HomePage() {
       setIsInstallAvailable(false);
     }
   }, [installPromptEvent]);
+
+  useEffect(() => {
+    return () => {
+      releaseScrollLock();
+    };
+  }, [releaseScrollLock]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
@@ -1061,6 +1145,14 @@ export default function HomePage() {
     [handleUpdateStatus]
   );
 
+  const handleDragStart = useCallback(() => {
+    lockScrollDuringDrag();
+  }, [lockScrollDuringDrag]);
+
+  const handleDragCancel = useCallback(() => {
+    releaseScrollLock();
+  }, [releaseScrollLock]);
+
   useEffect(
     () => () => {
       if (eventSourceRef.current) {
@@ -1073,6 +1165,7 @@ export default function HomePage() {
 
   const handleDragEnd = useCallback(
     async (event: DragEndEvent) => {
+      releaseScrollLock();
       const { active, over } = event;
       if (!over) return;
 
@@ -1089,7 +1182,7 @@ export default function HomePage() {
         // Already handled in handleUpdateStatus
       }
     },
-    [handleUpdateStatus]
+    [handleUpdateStatus, releaseScrollLock]
   );
 
   const groupedTodos = useMemo(() => {
@@ -1185,6 +1278,8 @@ export default function HomePage() {
         <DndContext
           sensors={sensors}
           collisionDetection={closestCorners}
+          onDragStart={handleDragStart}
+          onDragCancel={handleDragCancel}
           onDragEnd={handleDragEnd}
         >
           <div className="grid gap-4 md:grid-cols-3">
