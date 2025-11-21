@@ -27,6 +27,7 @@ import {
   getAuthToken,
   API_URL,
   updateTodo,
+  updateTodoWithImage,
   deleteTodo,
 } from "../services/api";
 import type { TodoFormValues } from "../components/TodoItem";
@@ -1086,6 +1087,85 @@ export default function HomePage() {
     [updateTodo, updateTodosState]
   );
 
+  const handleUpdateImage = useCallback(
+    async (target: Todo, imageFile: File | null) => {
+      const snapshot = cloneTodos(todosRef.current);
+
+      // Optimistically update
+      if (imageFile) {
+        const tempUrl = URL.createObjectURL(imageFile);
+        updateTodosState((prev) =>
+          prev.map((t) => {
+            if (t.id === target.id) {
+              return { ...t, imageUrl: tempUrl };
+            }
+            if (t.subtodos?.some((st) => st.id === target.id)) {
+              return {
+                ...t,
+                subtodos: t.subtodos.map((st) =>
+                  st.id === target.id ? { ...st, imageUrl: tempUrl } : st
+                ),
+              };
+            }
+            return t;
+          })
+        );
+      } else {
+        // Optimistically remove image
+        updateTodosState((prev) =>
+          prev.map((t) => {
+            if (t.id === target.id) {
+              return { ...t, imageUrl: null };
+            }
+            if (t.subtodos?.some((st) => st.id === target.id)) {
+              return {
+                ...t,
+                subtodos: t.subtodos.map((st) =>
+                  st.id === target.id ? { ...st, imageUrl: null } : st
+                ),
+              };
+            }
+            return t;
+          })
+        );
+      }
+
+      try {
+        const formData = new FormData();
+        // Keep existing title and description
+        formData.append("title", target.title);
+        if (target.description) {
+          formData.append("description", target.description);
+        }
+
+        if (imageFile) {
+          formData.append("image", imageFile);
+        } else {
+          formData.append("removeImage", "true");
+        }
+
+        const updated = await updateTodoWithImage(target.id, formData);
+        const normalized = normalizeTodo(updated);
+
+        // Clean up temporary URL if it was created
+        if (imageFile) {
+          const tempUrl = URL.createObjectURL(imageFile);
+          URL.revokeObjectURL(tempUrl);
+        }
+
+        updateTodosState((prev) => upsertTodoInTree(prev, normalized));
+        setError(null);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Failed to update image";
+        setError(message);
+        updateTodosState(() => snapshot);
+        throw err instanceof Error ? err : new Error(message);
+      }
+    },
+    [updateTodosState]
+  );
+
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -1328,6 +1408,7 @@ export default function HomePage() {
           onDeleteSubTodo={handleDeleteSubTodo}
           onUpdateDetails={handleUpdateDetails}
           onUpdateTimeline={handleUpdateTimeline}
+          onUpdateImage={handleUpdateImage}
         />
       )}
 

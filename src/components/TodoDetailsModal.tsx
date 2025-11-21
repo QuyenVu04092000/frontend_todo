@@ -22,6 +22,7 @@ interface TodoDetailsModalProps {
     todo: Todo,
     values: { startDate: string | null; endDate: string | null }
   ) => Promise<void>;
+  onUpdateImage: (todo: Todo, imageFile: File | null) => Promise<void>;
 }
 
 const STATUS_TEXT: Record<Todo["status"], string> = {
@@ -40,6 +41,7 @@ export default function TodoDetailsModal({
   onDeleteSubTodo,
   onUpdateDetails,
   onUpdateTimeline,
+  onUpdateImage,
 }: TodoDetailsModalProps) {
   const createdAt = useMemo(
     () => new Date(todo.createdAt).toLocaleString(),
@@ -70,6 +72,9 @@ export default function TodoDetailsModal({
   const [isSavingDetails, setIsSavingDetails] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [detailsSuccess, setDetailsSuccess] = useState<string | null>(null);
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [imageSuccess, setImageSuccess] = useState<string | null>(null);
 
   useEffect(() => {
     setEditTitle(todo.title);
@@ -319,18 +324,113 @@ export default function TodoDetailsModal({
             </form>
           </section>
 
-          {imageSrc && (
-            <section>
+          <section>
+            <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-gray-700">
-                Attached image
+                {imageSrc ? "Attached image" : "Upload image"}
               </h3>
-              <img
-                src={imageSrc}
-                alt={todo.title}
-                className="mt-3 w-full rounded-lg object-cover shadow"
-              />
-            </section>
-          )}
+              {imageSrc && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setIsUploadingImage(true);
+                    setImageError(null);
+                    setImageSuccess(null);
+                    try {
+                      await onUpdateImage(todo, null);
+                      setImageSuccess("Image removed");
+                    } catch (error) {
+                      setImageError(
+                        error instanceof Error
+                          ? error.message
+                          : "Failed to remove image"
+                      );
+                    } finally {
+                      setIsUploadingImage(false);
+                    }
+                  }}
+                  disabled={isUploadingImage}
+                  className="rounded-full border border-red-200 px-3 py-1 text-xs font-semibold text-red-500 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            {imageSrc ? (
+              <div className="mt-3 overflow-hidden rounded-lg border border-gray-200 bg-gray-50 shadow-sm">
+                <img
+                  src={imageSrc}
+                  alt={todo.title}
+                  className="w-full max-h-96 object-contain"
+                  loading="lazy"
+                />
+              </div>
+            ) : (
+              <div className="mt-3">
+                <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-6 transition hover:border-brand-500 hover:bg-gray-100">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    disabled={isUploadingImage}
+                    onChange={async (event) => {
+                      const file = event.target.files?.[0];
+                      if (!file) return;
+
+                      setIsUploadingImage(true);
+                      setImageError(null);
+                      setImageSuccess(null);
+
+                      try {
+                        await onUpdateImage(todo, file);
+                        setImageSuccess("Image uploaded successfully");
+                        // Reset file input
+                        event.target.value = "";
+                      } catch (error) {
+                        setImageError(
+                          error instanceof Error
+                            ? error.message
+                            : "Failed to upload image"
+                        );
+                      } finally {
+                        setIsUploadingImage(false);
+                      }
+                    }}
+                  />
+                  <svg
+                    className="mb-2 h-8 w-8 text-gray-400"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+                    />
+                  </svg>
+                  <span className="text-sm font-medium text-gray-600">
+                    {isUploadingImage
+                      ? "Uploading..."
+                      : "Click to upload image"}
+                  </span>
+                  <span className="mt-1 text-xs text-gray-500">
+                    PNG, JPG, GIF up to 5MB
+                  </span>
+                </label>
+              </div>
+            )}
+            {(imageError || imageSuccess) && (
+              <p
+                className={`mt-2 text-sm ${
+                  imageError ? "text-red-600" : "text-emerald-600"
+                }`}
+              >
+                {imageError ?? imageSuccess}
+              </p>
+            )}
+          </section>
 
           <section>
             <h3 className="text-sm font-semibold text-gray-700">Status</h3>

@@ -117,11 +117,11 @@ const DraggableTodoCard = ({
       )}
 
       {imageSrc && (
-        <div className="overflow-hidden rounded-xl border border-gray-100">
+        <div className="overflow-hidden rounded-xl border border-gray-100 bg-gray-50">
           <img
             src={imageSrc}
             alt={`${todo.title} reference`}
-            className="h-36 w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.02]"
+            className="w-full max-h-64 object-contain transition-transform duration-300 ease-out group-hover:scale-[1.01]"
             loading="lazy"
           />
         </div>

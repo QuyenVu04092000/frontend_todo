@@ -145,6 +145,18 @@ export async function updateTodo(
   return handleResponse<Todo>(res);
 }
 
+export async function updateTodoWithImage(
+  id: number,
+  formData: FormData
+): Promise<Todo> {
+  const res = await fetch(`${API_URL}/api/todos/${id}`, {
+    method: "PATCH",
+    headers: withAuthHeaders(),
+    body: formData,
+  });
+  return handleResponse<Todo>(res);
+}
+
 export async function deleteTodo(id: number): Promise<void> {
   const res = await fetch(`${API_URL}/api/todos/${id}`, {
     method: "DELETE",
