@@ -57,7 +57,7 @@ npm run lint
 ## PWA Support
 
 - Manifest located at `public/manifest.json`
-- Icons in `public/icon-192.png` and `public/icon-512.png`
+- Icons in `public/todo-192.png` and `public/todo-512.png`
 - Service worker generated via [`next-pwa`](https://github.com/shadowwalker/next-pwa). It registers automatically in production builds.
 
 To test PWA behaviour locally:
@@ -70,8 +70,8 @@ To test PWA behaviour locally:
 ```
 todolist-frontend/
 ├─ public/
-│  ├─ icon-192.png
-│  ├─ icon-512.png
+│  ├─ todo-192.png
+│  ├─ todo-512.png
 │  └─ manifest.json
 ├─ src/
 │  ├─ pages/

@@ -1141,7 +1141,8 @@ export default function HomePage() {
         if (imageFile) {
           formData.append("image", imageFile);
         } else {
-          formData.append("removeImage", "true");
+          // Send empty string to indicate image removal
+          formData.append("imageUrl", "");
         }
 
         const updated = await updateTodoWithImage(target.id, formData);
