@@ -57,7 +57,7 @@ npm run lint
 ## PWA Support
 
 - Manifest located at `public/manifest.json`
-- Icons in `public/todo-192.png` and `public/todo-512.png`
+- Icons in `public/apple-touch-icon.png` and `public/apple-touch-icon.png`
 - Service worker generated via [`next-pwa`](https://github.com/shadowwalker/next-pwa). It registers automatically in production builds.
 
 To test PWA behaviour locally:

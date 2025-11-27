@@ -16,10 +16,21 @@ class MyDocument extends Document {
     return (
       <Html lang="en">
         <Head>
-          <meta name="theme-color" content="#4f46e5" />
-          <link rel="manifest" href="/manifest.json" />
-          <link rel="apple-touch-icon" sizes="192x192" href="/todo-192.png" />
-          <link rel="apple-touch-icon" sizes="512x512" href="/todo-512.png" />
+          <link
+            rel="icon"
+            type="image/png"
+            href="/favicon-96x96.png"
+            sizes="96x96"
+          />
+          <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+          <link rel="shortcut icon" href="/favicon.ico" />
+          <link
+            rel="apple-touch-icon"
+            sizes="180x180"
+            href="/apple-touch-icon.png"
+          />
+          <meta name="apple-mobile-web-app-title" content="MyWebSite" />
+          <link rel="manifest" href="/site.webmanifest" />
         </Head>
         <body className="bg-gray-100 text-gray-900">
           <Main />
