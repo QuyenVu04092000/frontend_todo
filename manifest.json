@@ -1,11 +1,11 @@
 {
-  "name": "TodoList App",
-  "short_name": "TodoList",
-  "description": "Todo List App with SubTodo, Timeline, Image Upload",
-  "start_url": "/",
+  "name": "Todo App",
+  "short_name": "Todo",
+  "start_url": "/frontend_todo/index.html",
+  "scope": "/frontend_todo/",
   "display": "standalone",
   "background_color": "#ffffff",
-  "theme_color": "#4f46e5",
+  "theme_color": "#ffffff",
   "icons": [
     {
       "src": "/apple-touch-icon.png",
