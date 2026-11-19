@@ -1,28 +1,35 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
-import type { Todo } from "../services/api";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import type { Todo, TodoChanges } from "../services/api";
 import { API_URL } from "../services/api";
-import { formatDateForDisplay, formatDateForInput } from "../utils/timeline";
+import { formatDateForInput } from "../utils/timeline";
+import {
+  ChevronIcon,
+  ImageIcon,
+  PlusIcon,
+  TrashIcon,
+  XIcon,
+} from "./icons";
+import { STATUS_META, STATUS_ORDER } from "./status";
 
 interface TodoDetailsModalProps {
   todo: Todo;
   onClose: () => void;
-  onUpdateStatus: (todo: Todo, status: Todo["status"]) => Promise<void>;
-  onCreateSubTodo: (
-    parent: Todo,
-    values: { title: string; description?: string }
-  ) => Promise<void>;
+  /** Saves every changed field of the form in one request. */
+  onSave: (todo: Todo, changes: TodoChanges) => Promise<Todo>;
+  onCreateSubTodo: (parent: Todo, values: { title: string }) => Promise<void>;
   onToggleSubTodo: (subTodo: Todo, completed: boolean) => Promise<void>;
+  onRenameSubTodo: (subTodo: Todo, title: string) => Promise<void>;
   onDeleteTodo: (todo: Todo) => Promise<void>;
   onDeleteSubTodo: (subTodo: Todo) => Promise<void>;
-  onUpdateDetails: (
-    todo: Todo,
-    values: { title: string; description: string | null }
-  ) => Promise<void>;
-  onUpdateTimeline: (
-    todo: Todo,
-    values: { startDate: string | null; endDate: string | null }
-  ) => Promise<void>;
-  onUpdateImage: (todo: Todo, imageFile: File | null) => Promise<void>;
 }
 
 const STATUS_TEXT: Record<Todo["status"], string> = {
@@ -31,79 +38,280 @@ const STATUS_TEXT: Record<Todo["status"], string> = {
   DONE: "Đã làm",
 };
 
+const DISCARD_CONFIRM = "Bạn có thay đổi chưa lưu. Bỏ thay đổi?";
+
+/** Unsaved edits of the form. Dates are `YYYY-MM-DD` ("" = none). */
+interface Draft {
+  title: string;
+  description: string;
+  status: Todo["status"];
+  startDate: string;
+  endDate: string;
+  imageFile: File | null;
+  removeImage: boolean;
+}
+
+const draftFromTodo = (todo: Todo): Draft => ({
+  title: todo.title,
+  description: todo.description ?? "",
+  status: todo.status,
+  startDate: formatDateForInput(todo.startDate),
+  endDate: formatDateForInput(todo.endDate),
+  imageFile: null,
+  removeImage: false,
+});
+
+const sameDraft = (a: Draft, b: Draft) =>
+  a.title === b.title &&
+  a.description === b.description &&
+  a.status === b.status &&
+  a.startDate === b.startDate &&
+  a.endDate === b.endDate &&
+  a.imageFile === b.imageFile &&
+  a.removeImage === b.removeImage;
+
+/** Only the fields that differ from the saved todo. */
+const computeChanges = (draft: Draft, todo: Todo): TodoChanges => {
+  const changes: TodoChanges = {};
+  const title = draft.title.trim();
+  if (title !== todo.title) changes.title = title;
+
+  const description = draft.description.trim();
+  if (description !== (todo.description ?? "").trim()) {
+    changes.description = description || null;
+  }
+
+  if (draft.status !== todo.status) changes.status = draft.status;
+
+  if (draft.startDate !== formatDateForInput(todo.startDate)) {
+    changes.startDate = draft.startDate || null;
+  }
+  if (draft.endDate !== formatDateForInput(todo.endDate)) {
+    changes.endDate = draft.endDate || null;
+  }
+
+  if (draft.imageFile) {
+    changes.imageFile = draft.imageFile;
+  } else if (draft.removeImage && todo.imageUrl) {
+    changes.removeImage = true;
+  }
+  return changes;
+};
+
+const resolveImageSrc = (imageUrl?: string | null) => {
+  if (!imageUrl) return null;
+  if (
+    imageUrl.startsWith("http://") ||
+    imageUrl.startsWith("https://") ||
+    imageUrl.startsWith("blob:")
+  ) {
+    return imageUrl;
+  }
+  return `${API_URL}${imageUrl}`;
+};
+
+type Feedback = { kind: "error" | "success"; text: string } | null;
+
 export default function TodoDetailsModal({
   todo,
   onClose,
-  onUpdateStatus,
+  onSave,
   onCreateSubTodo,
   onToggleSubTodo,
+  onRenameSubTodo,
   onDeleteTodo,
   onDeleteSubTodo,
-  onUpdateDetails,
-  onUpdateTimeline,
-  onUpdateImage,
 }: TodoDetailsModalProps) {
   const createdAt = useMemo(
     () => new Date(todo.createdAt).toLocaleString(),
-    [todo.createdAt]
+    [todo.createdAt],
   );
-  const imageSrc = todo.imageUrl
-    ? todo.imageUrl.startsWith("http")
-      ? todo.imageUrl
-      : `${API_URL}${todo.imageUrl}`
-    : null;
-  const [subTitle, setSubTitle] = useState("");
-  const [subDescription, setSubDescription] = useState("");
-  const [isCreatingSubTodo, setIsCreatingSubTodo] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
-  const [startInput, setStartInput] = useState<string>(
-    formatDateForInput(todo.startDate)
-  );
-  const [endInput, setEndInput] = useState<string>(
-    formatDateForInput(todo.endDate)
-  );
-  const [isSavingTimeline, setIsSavingTimeline] = useState(false);
-  const [timelineError, setTimelineError] = useState<string | null>(null);
-  const [timelineSuccess, setTimelineSuccess] = useState<string | null>(null);
-  const [editTitle, setEditTitle] = useState<string>(todo.title);
-  const [editDescription, setEditDescription] = useState<string>(
-    todo.description ?? ""
-  );
-  const [isSavingDetails, setIsSavingDetails] = useState(false);
-  const [detailsError, setDetailsError] = useState<string | null>(null);
-  const [detailsSuccess, setDetailsSuccess] = useState<string | null>(null);
-  const [isUploadingImage, setIsUploadingImage] = useState(false);
-  const [imageError, setImageError] = useState<string | null>(null);
-  const [imageSuccess, setImageSuccess] = useState<string | null>(null);
+
+  // ---------- Draft (everything except the checklist) ----------
+
+  const [draft, setDraft] = useState<Draft>(() => draftFromTodo(todo));
+  const [isSaving, setIsSaving] = useState(false);
+  const [feedback, setFeedback] = useState<Feedback>(null);
+
+  // The saved values the current draft was based on. When the todo changes
+  // under us (SSE, checklist actions) we only follow it if the user hasn't
+  // edited anything yet; a dirty draft is never overwritten.
+  const baseRef = useRef<{ id: number; draft: Draft }>({
+    id: todo.id,
+    draft: draftFromTodo(todo),
+  });
+  useEffect(() => {
+    const nextBase = draftFromTodo(todo);
+    const prev = baseRef.current;
+    if (prev.id !== todo.id) {
+      setDraft(nextBase);
+      setFeedback(null);
+    } else {
+      setDraft((current) =>
+        sameDraft(current, prev.draft) ? nextBase : current,
+      );
+    }
+    baseRef.current = { id: todo.id, draft: nextBase };
+  }, [todo]);
+
+  const changes = useMemo(() => computeChanges(draft, todo), [draft, todo]);
+  const isDirty = Object.keys(changes).length > 0;
+
+  const updateDraft = (patch: Partial<Draft>) => {
+    setDraft((current) => ({ ...current, ...patch }));
+    setFeedback(null);
+  };
+
+  const handleDiscard = () => {
+    setDraft(draftFromTodo(todo));
+    setFeedback(null);
+  };
+
+  const handleSave = async () => {
+    if (!isDirty || isSaving) return;
+    if (!draft.title.trim()) {
+      setFeedback({ kind: "error", text: "Tiêu đề không được để trống" });
+      return;
+    }
+    if (draft.startDate && draft.endDate && draft.startDate > draft.endDate) {
+      setFeedback({
+        kind: "error",
+        text: "Ngày bắt đầu phải trước hoặc bằng ngày kết thúc",
+      });
+      return;
+    }
+
+    setIsSaving(true);
+    setFeedback(null);
+    try {
+      const updated = await onSave(todo, changes);
+      const nextBase = draftFromTodo(updated);
+      baseRef.current = { id: updated.id, draft: nextBase };
+      setDraft(nextBase);
+      setFeedback({ kind: "success", text: "Đã lưu" });
+    } catch (error) {
+      // Keep the draft so nothing typed is lost.
+      setFeedback({
+        kind: "error",
+        text: error instanceof Error ? error.message : "Lưu thất bại",
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Lets the keyboard shortcut call the latest handleSave.
+  const saveRef = useRef(handleSave);
+  saveRef.current = handleSave;
+
+  const requestClose = useCallback(() => {
+    if (isDirty && !window.confirm(DISCARD_CONFIRM)) return;
+    onClose();
+  }, [isDirty, onClose]);
 
   useEffect(() => {
-    setEditTitle(todo.title);
-    setEditDescription(todo.description ?? "");
-    setDetailsError(null);
-    setDetailsSuccess(null);
-    setStartInput(formatDateForInput(todo.startDate));
-    setEndInput(formatDateForInput(todo.endDate));
-    setTimelineError(null);
-    setTimelineSuccess(null);
-  }, [todo.description, todo.endDate, todo.id, todo.startDate, todo.title]);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        // Inline checklist editing handles its own Escape.
+        if (event.defaultPrevented) return;
+        requestClose();
+      } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        void saveRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [requestClose]);
 
-  const handleRootStatusChange = async (nextStatus: Todo["status"]) => {
-    if (nextStatus === todo.status) return;
-    await onUpdateStatus(todo, nextStatus);
+  // ---------- Image preview ----------
+
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!draft.imageFile) {
+      setPreviewUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(draft.imageFile);
+    setPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [draft.imageFile]);
+
+  const displayedImage = draft.imageFile
+    ? previewUrl
+    : draft.removeImage
+      ? null
+      : resolveImageSrc(todo.imageUrl);
+
+  // ---------- Notes auto-grow ----------
+
+  const notesRef = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const el = notesRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    // scrollHeight excludes borders; add them back so no scrollbar appears.
+    const border = el.offsetHeight - el.clientHeight;
+    el.style.height = `${el.scrollHeight + border}px`;
+  }, [draft.description]);
+
+  // ---------- Checklist ----------
+  // The checklist is independent of the draft: tick, add, rename and delete
+  // are applied immediately (like Microsoft To Do / Things / TickTick) and
+  // never make the form dirty.
+
+  const subtodos = todo.subtodos ?? [];
+  const completedCount = subtodos.filter((sub) => sub.status === "DONE").length;
+  const checklistProgress = subtodos.length
+    ? Math.round((completedCount / subtodos.length) * 100)
+    : 0;
+
+  const [newStep, setNewStep] = useState("");
+  const newStepRef = useRef<HTMLInputElement>(null);
+
+  const reportError = (error: unknown, fallback: string) =>
+    setFeedback({
+      kind: "error",
+      text: error instanceof Error ? error.message : fallback,
+    });
+
+  // The new step shows up optimistically, so clear the input right away and
+  // let the user keep typing; put the text back only if the request fails.
+  const handleAddStep = async (event?: FormEvent) => {
+    event?.preventDefault();
+    const title = newStep.trim();
+    if (!title) return;
+    setNewStep("");
+    newStepRef.current?.focus();
+    try {
+      await onCreateSubTodo(todo, { title });
+    } catch (error) {
+      setNewStep((current) => current || title);
+      reportError(error, "Không thêm được bước");
+    }
   };
 
-  const handleSubTodoToggle = async (subTodo: Todo, checked: boolean) => {
-    await onToggleSubTodo(subTodo, checked);
+  const handleToggleStep = async (subTodo: Todo, checked: boolean) => {
+    try {
+      await onToggleSubTodo(subTodo, checked);
+    } catch (error) {
+      reportError(error, "Không cập nhật được bước");
+    }
   };
 
-  const handleSubTodoDelete = async (subTodo: Todo) => {
-    setCreateError(null);
+  const handleDeleteStep = async (subTodo: Todo) => {
     try {
       await onDeleteSubTodo(subTodo);
     } catch (error) {
-      setCreateError(
-        error instanceof Error ? error.message : "Failed to delete subtodo"
-      );
+      reportError(error, "Không xoá được bước");
+    }
+  };
+
+  const handleRenameStep = async (subTodo: Todo, title: string) => {
+    try {
+      await onRenameSubTodo(subTodo, title);
+    } catch (error) {
+      reportError(error, "Không đổi tên được bước");
     }
   };
 
@@ -112,506 +320,499 @@ export default function TodoDetailsModal({
       await onDeleteTodo(todo);
       onClose();
     } catch (error) {
-      setCreateError(
-        error instanceof Error ? error.message : "Failed to delete todo"
-      );
+      reportError(error, "Không xoá được todo");
     }
   };
 
-  const handleDetailsReset = () => {
-    setEditTitle(todo.title);
-    setEditDescription(todo.description ?? "");
-    setDetailsError(null);
-    setDetailsSuccess(null);
-  };
+  // ---------- Activity ----------
 
-  const handleDetailsSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const trimmedTitle = editTitle.trim();
-    const trimmedDescription = editDescription.trim();
-    if (!trimmedTitle) {
-      setDetailsError("Title is required");
-      setDetailsSuccess(null);
-      return;
-    }
-
-    const currentDescription = (todo.description ?? "").trim();
-    if (
-      trimmedTitle === todo.title &&
-      trimmedDescription === currentDescription
-    ) {
-      setDetailsError(null);
-      setDetailsSuccess("No changes to save");
-      return;
-    }
-
-    setIsSavingDetails(true);
-    setDetailsError(null);
-    setDetailsSuccess(null);
-
-    try {
-      await onUpdateDetails(todo, {
-        title: trimmedTitle,
-        description: trimmedDescription ? trimmedDescription : null,
-      });
-      setEditTitle(trimmedTitle);
-      setEditDescription(trimmedDescription);
-      setDetailsSuccess("Todo details updated");
-    } catch (error) {
-      setDetailsError(
-        error instanceof Error ? error.message : "Failed to update todo"
-      );
-    } finally {
-      setIsSavingDetails(false);
-    }
-  };
-
-  const handleTimelineSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-
-    setIsSavingTimeline(true);
-    setTimelineError(null);
-    setTimelineSuccess(null);
-
-    try {
-      await onUpdateTimeline(todo, {
-        startDate: startInput ? startInput : null,
-        endDate: endInput ? endInput : null,
-      });
-      setTimelineSuccess("Timeline updated");
-    } catch (error) {
-      setTimelineError(
-        error instanceof Error ? error.message : "Failed to update timeline"
-      );
-    }
-
-    setIsSavingTimeline(false);
-  };
-
-  const handleCreateSubTodoSubmit = async (
-    event: FormEvent<HTMLFormElement>
-  ) => {
-    event.preventDefault();
-    if (!subTitle.trim()) {
-      setCreateError("Subtodo title is required");
-      return;
-    }
-    setIsCreatingSubTodo(true);
-    setCreateError(null);
-    try {
-      await onCreateSubTodo(todo, {
-        title: subTitle.trim(),
-        description: subDescription.trim() || undefined,
-      });
-      setSubTitle("");
-      setSubDescription("");
-    } catch (error) {
-      setCreateError(
-        error instanceof Error ? error.message : "Failed to create subtodo"
-      );
-    } finally {
-      setIsCreatingSubTodo(false);
-    }
-  };
+  const activity = useMemo(
+    () =>
+      [...(todo.timeline ?? [])].sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      ),
+    [todo.timeline],
+  );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl bg-white shadow-xl">
-        <header className="flex items-start justify-between gap-4 border-b border-gray-200 p-6">
-          <div>
-            <p className="text-xs uppercase tracking-wide text-gray-500">
-              Todo Detail
-            </p>
-            <h2 className="mt-1 text-2xl font-semibold text-gray-900">
+    <div
+      className="fixed inset-0 z-50 flex animate-fade-in items-end justify-center bg-slate-900/50 backdrop-blur-sm sm:items-center sm:p-4"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) requestClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="todo-detail-title"
+        className="flex h-[94vh] w-full animate-sheet-up flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl sm:h-auto sm:max-h-[90vh] sm:max-w-2xl sm:rounded-2xl"
+      >
+        <div className="mx-auto mt-2.5 h-1 w-10 shrink-0 rounded-full bg-slate-300 sm:hidden" />
+        <header className="flex shrink-0 items-start gap-3 border-b border-slate-100 px-5 pb-4 pt-3 sm:px-6 sm:pt-5">
+          <div className="min-w-0 flex-1">
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-semibold ring-1 ring-inset ${
+                STATUS_META[todo.status].badge
+              }`}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${STATUS_META[todo.status].dot}`}
+              />
+              {STATUS_TEXT[todo.status]}
+            </span>
+            <h2
+              id="todo-detail-title"
+              className="mt-2 break-words text-xl font-semibold leading-tight text-slate-900 sm:text-2xl"
+            >
               {todo.title}
             </h2>
-            <p className="mt-2 text-sm text-gray-500">
-              Created at: {createdAt}
-            </p>
+            <p className="mt-1 text-xs text-slate-500">Created {createdAt}</p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1">
             <button
               type="button"
               onClick={handleTodoDelete}
-              className="rounded-full border border-red-200 px-3 py-1 text-sm font-semibold text-red-500 transition hover:bg-red-50"
+              className="icon-btn hover:bg-red-50 hover:text-red-600"
+              aria-label="Delete todo"
+              title="Delete todo"
             >
-              Delete
+              <TrashIcon />
             </button>
             <button
               type="button"
-              onClick={onClose}
-              className="rounded-full border border-gray-300 px-3 py-1 text-sm text-gray-500 transition hover:bg-gray-100"
+              onClick={requestClose}
+              className="icon-btn"
+              aria-label="Close"
             >
-              Close
+              <XIcon />
             </button>
           </div>
         </header>
 
-        <div className="space-y-6 p-6">
-          <section className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
-            <h3 className="text-sm font-semibold text-gray-700">
-              Edit details
-            </h3>
-            <form onSubmit={handleDetailsSubmit} className="mt-3 space-y-4">
-              <div className="grid gap-1">
-                <label
-                  className="text-xs font-semibold uppercase tracking-wide text-gray-500"
-                  htmlFor="todo-title"
-                >
-                  Title
-                </label>
-                <input
-                  id="todo-title"
-                  type="text"
-                  value={editTitle}
-                  onChange={(event) => {
-                    setEditTitle(event.target.value);
-                    setDetailsError(null);
-                    setDetailsSuccess(null);
-                  }}
-                  disabled={isSavingDetails}
-                  className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-70"
-                  placeholder="Project kickoff"
-                />
-              </div>
-              <div className="grid gap-1">
-                <label
-                  className="text-xs font-semibold uppercase tracking-wide text-gray-500"
-                  htmlFor="todo-description"
-                >
-                  Description
-                </label>
-                <textarea
-                  id="todo-description"
-                  value={editDescription}
-                  onChange={(event) => {
-                    setEditDescription(event.target.value);
-                    setDetailsError(null);
-                    setDetailsSuccess(null);
-                  }}
-                  disabled={isSavingDetails}
-                  className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-70"
-                  rows={4}
-                  placeholder="Context, goals, links..."
-                />
-              </div>
-              {(detailsError || detailsSuccess) && (
-                <p
-                  className={`text-sm ${
-                    detailsError ? "text-red-600" : "text-emerald-600"
-                  }`}
-                >
-                  {detailsError ?? detailsSuccess}
+        <div className="flex-1 space-y-6 overflow-y-auto px-5 py-5 sm:px-6">
+          {/* Title */}
+          <div className="grid gap-1.5">
+            <label className="field-label" htmlFor="todo-title">
+              Title
+            </label>
+            <input
+              id="todo-title"
+              type="text"
+              value={draft.title}
+              onChange={(event) => updateDraft({ title: event.target.value })}
+              disabled={isSaving}
+              className="field"
+              placeholder="Project kickoff"
+            />
+          </div>
+
+          {/* Status (draft only) */}
+          <section>
+            <h3 className="field-label mb-2">Status</h3>
+            <div
+              role="radiogroup"
+              aria-label="Status"
+              className="grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1"
+            >
+              {STATUS_ORDER.map((status) => {
+                const isActive = draft.status === status;
+                return (
+                  <button
+                    key={status}
+                    type="button"
+                    role="radio"
+                    aria-checked={isActive}
+                    disabled={isSaving}
+                    onClick={() => updateDraft({ status })}
+                    className={`flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold transition ${
+                      isActive
+                        ? "bg-white text-slate-900 shadow-sm"
+                        : "text-slate-500 hover:text-slate-800"
+                    }`}
+                  >
+                    <span
+                      className={`h-2 w-2 rounded-full ${STATUS_META[status].dot}`}
+                    />
+                    {STATUS_TEXT[status]}
+                  </button>
+                );
+              })}
+            </div>
+            {draft.status === "DONE" &&
+              todo.status !== "DONE" &&
+              completedCount < subtodos.length && (
+                <p className="mt-2 text-xs text-slate-500">
+                  Khi lưu, mọi bước trong checklist cũng sẽ được đánh dấu xong.
                 </p>
               )}
-              <div className="flex items-center gap-3">
-                <button
-                  type="submit"
-                  disabled={isSavingDetails}
-                  className="inline-flex items-center rounded-full bg-brand-500 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:opacity-70"
-                >
-                  {isSavingDetails ? "Saving…" : "Save changes"}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDetailsReset}
-                  disabled={isSavingDetails}
-                  className="rounded-full border border-gray-300 px-4 py-2 text-xs font-medium text-gray-600 transition hover:border-brand-500 hover:text-brand-500 disabled:cursor-not-allowed disabled:opacity-70"
-                >
-                  Reset
-                </button>
-              </div>
-            </form>
           </section>
 
+          {/* Dates */}
+          <div className="grid grid-cols-2 gap-3">
+            <label className="grid min-w-0 gap-1.5">
+              <span className="field-label">Start</span>
+              <input
+                type="date"
+                value={draft.startDate}
+                max={draft.endDate || undefined}
+                onChange={(event) =>
+                  updateDraft({ startDate: event.target.value })
+                }
+                disabled={isSaving}
+                className="field min-h-[44px]"
+              />
+            </label>
+            <label className="grid min-w-0 gap-1.5">
+              <span className="field-label">End</span>
+              <input
+                type="date"
+                value={draft.endDate}
+                min={draft.startDate || undefined}
+                onChange={(event) =>
+                  updateDraft({ endDate: event.target.value })
+                }
+                disabled={isSaving}
+                className="field min-h-[44px]"
+              />
+            </label>
+          </div>
+
+          {/* Notes */}
+          <div className="grid gap-1.5">
+            <label className="field-label" htmlFor="todo-notes">
+              Notes
+            </label>
+            <textarea
+              id="todo-notes"
+              ref={notesRef}
+              value={draft.description}
+              onChange={(event) =>
+                updateDraft({ description: event.target.value })
+              }
+              disabled={isSaving}
+              className="field max-h-80 resize-none overflow-y-auto"
+              rows={2}
+              placeholder="Thêm ghi chú…"
+            />
+          </div>
+
+          {/* Checklist (applied immediately, not part of the draft) */}
           <section>
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-gray-700">
-                {imageSrc ? "Attached image" : "Upload image"}
-              </h3>
-              {imageSrc && (
-                <button
-                  type="button"
-                  onClick={async () => {
-                    setIsUploadingImage(true);
-                    setImageError(null);
-                    setImageSuccess(null);
-                    try {
-                      await onUpdateImage(todo, null);
-                      setImageSuccess("Image removed");
-                    } catch (error) {
-                      setImageError(
-                        error instanceof Error
-                          ? error.message
-                          : "Failed to remove image"
-                      );
-                    } finally {
-                      setIsUploadingImage(false);
-                    }
-                  }}
-                  disabled={isUploadingImage}
-                  className="rounded-full border border-red-200 px-3 py-1 text-xs font-semibold text-red-500 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-70"
-                >
-                  Remove
-                </button>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="field-label">Checklist</h3>
+              {subtodos.length > 0 && (
+                <span className="text-xs font-medium tabular-nums text-slate-500">
+                  {completedCount}/{subtodos.length}
+                </span>
               )}
             </div>
-            {imageSrc ? (
-              <div className="mt-3 overflow-hidden rounded-lg border border-gray-200 bg-gray-50 shadow-sm">
+            {subtodos.length > 0 && (
+              <div className="mb-2 h-1 overflow-hidden rounded-full bg-slate-100">
+                <div
+                  className="h-full rounded-full bg-emerald-500 transition-all duration-300"
+                  style={{ width: `${checklistProgress}%` }}
+                />
+              </div>
+            )}
+            <ul className="divide-y divide-slate-100 overflow-hidden rounded-xl border border-slate-200">
+              {subtodos.map((subTodo) => (
+                <ChecklistItem
+                  key={subTodo.id}
+                  item={subTodo}
+                  onToggle={handleToggleStep}
+                  onRename={handleRenameStep}
+                  onDelete={handleDeleteStep}
+                />
+              ))}
+              <li className="bg-white">
+                <form
+                  onSubmit={handleAddStep}
+                  className="flex items-center gap-2 px-3"
+                >
+                  <PlusIcon
+                    width={18}
+                    height={18}
+                    className="shrink-0 text-slate-400"
+                  />
+                  <input
+                    ref={newStepRef}
+                    type="text"
+                    value={newStep}
+                    onChange={(event) => setNewStep(event.target.value)}
+                    placeholder="Thêm bước…"
+                    aria-label="Thêm bước"
+                    className="min-w-0 flex-1 bg-transparent py-2.5 text-base text-slate-800 placeholder:text-slate-400 focus:outline-none sm:text-sm"
+                  />
+                  {newStep.trim() && (
+                    <button
+                      type="submit"
+                      className="rounded-md px-2 py-1 text-xs font-semibold text-brand-600 hover:bg-brand-50"
+                    >
+                      Thêm
+                    </button>
+                  )}
+                </form>
+              </li>
+            </ul>
+          </section>
+
+          {/* Image (draft only) */}
+          <section>
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="field-label">Image</h3>
+              {displayedImage && (
+                <div className="flex items-center gap-3">
+                  <label className="cursor-pointer text-xs font-semibold text-brand-600 hover:text-brand-700">
+                    Replace
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="sr-only"
+                      disabled={isSaving}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = "";
+                        if (file) {
+                          updateDraft({ imageFile: file, removeImage: false });
+                        }
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    disabled={isSaving}
+                    onClick={() =>
+                      updateDraft({
+                        imageFile: null,
+                        removeImage: Boolean(todo.imageUrl),
+                      })
+                    }
+                    className="text-xs font-semibold text-red-600 hover:text-red-700 disabled:opacity-60"
+                  >
+                    Remove
+                  </button>
+                </div>
+              )}
+            </div>
+            {displayedImage ? (
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
                 <img
-                  src={imageSrc}
+                  src={displayedImage}
                   alt={todo.title}
-                  className="w-full max-h-96 object-contain"
+                  className="max-h-96 w-full object-contain"
                   loading="lazy"
                 />
               </div>
             ) : (
-              <div className="mt-3">
-                <label className="flex cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed border-gray-300 bg-gray-50 p-6 transition hover:border-brand-500 hover:bg-gray-100">
-                  <input
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    disabled={isUploadingImage}
-                    onChange={async (event) => {
-                      const file = event.target.files?.[0];
-                      if (!file) return;
-
-                      setIsUploadingImage(true);
-                      setImageError(null);
-                      setImageSuccess(null);
-
-                      try {
-                        await onUpdateImage(todo, file);
-                        setImageSuccess("Image uploaded successfully");
-                        // Reset file input
-                        event.target.value = "";
-                      } catch (error) {
-                        setImageError(
-                          error instanceof Error
-                            ? error.message
-                            : "Failed to upload image"
-                        );
-                      } finally {
-                        setIsUploadingImage(false);
-                      }
-                    }}
-                  />
-                  <svg
-                    className="mb-2 h-8 w-8 text-gray-400"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-                    />
-                  </svg>
-                  <span className="text-sm font-medium text-gray-600">
-                    {isUploadingImage
-                      ? "Uploading..."
-                      : "Click to upload image"}
-                  </span>
-                  <span className="mt-1 text-xs text-gray-500">
-                    PNG, JPG, GIF up to 5MB
-                  </span>
-                </label>
-              </div>
-            )}
-            {(imageError || imageSuccess) && (
-              <p
-                className={`mt-2 text-sm ${
-                  imageError ? "text-red-600" : "text-emerald-600"
-                }`}
-              >
-                {imageError ?? imageSuccess}
-              </p>
+              <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 p-6 text-center transition hover:border-brand-400 hover:bg-brand-50/40">
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="sr-only"
+                  disabled={isSaving}
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (file) {
+                      updateDraft({ imageFile: file, removeImage: false });
+                    }
+                  }}
+                />
+                <ImageIcon
+                  width={28}
+                  height={28}
+                  className="mb-2 text-slate-400"
+                />
+                <span className="text-sm font-medium text-slate-700">
+                  Tap to choose an image
+                </span>
+                <span className="mt-1 text-xs text-slate-400">
+                  PNG, JPG, GIF up to 5MB
+                </span>
+              </label>
             )}
           </section>
 
-          <section>
-            <h3 className="text-sm font-semibold text-gray-700">Status</h3>
-            <div className="mt-2 flex flex-wrap items-center gap-3">
-              <span
-                className={`inline-flex items-center rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-wide ${
-                  todo.status === "DONE"
-                    ? "bg-green-100 text-green-700"
-                    : todo.status === "IN_PROGRESS"
-                    ? "bg-yellow-100 text-yellow-700"
-                    : "bg-gray-100 text-gray-600"
-                }`}
-              >
-                {todo.status.replace("_", " ")}
-              </span>
-              {/* <select
-                value={todo.status}
-                onChange={(event) =>
-                  handleRootStatusChange(event.target.value as Todo["status"])
-                }
-                className="rounded border border-gray-300 px-3 py-1 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <option value="TODO">Chưa làm</option>
-                <option value="IN_PROGRESS">Đang làm</option>
-                <option value="DONE">Đã làm</option>
-              </select> */}
-            </div>
-          </section>
-
-          <section className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
-            <h3 className="text-sm font-semibold text-gray-700">Timeline</h3>
-            <p className="mt-1 text-xs text-gray-500">
-              Set the planned start and end dates for this todo.
-            </p>
-            <form
-              onSubmit={handleTimelineSubmit}
-              className="mt-3 grid gap-3 md:grid-cols-2"
-            >
-              <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                Start date
-                <input
-                  type="date"
-                  value={startInput}
-                  onChange={(event) => {
-                    setStartInput(event.target.value);
-                    setTimelineError(null);
-                    setTimelineSuccess(null);
-                  }}
-                  className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-                  disabled={isSavingTimeline}
+          {/* Activity */}
+          {activity.length > 0 && (
+            <details className="group rounded-xl border border-slate-200">
+              <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 text-sm font-semibold text-slate-700 [&::-webkit-details-marker]:hidden">
+                <ChevronIcon
+                  width={16}
+                  height={16}
+                  className="text-slate-400 transition-transform group-open:rotate-90"
                 />
-              </label>
-              <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                End date
-                <input
-                  type="date"
-                  value={endInput}
-                  onChange={(event) => {
-                    setEndInput(event.target.value);
-                    setTimelineError(null);
-                    setTimelineSuccess(null);
-                  }}
-                  className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-                  disabled={isSavingTimeline}
-                />
-              </label>
-              <div className="col-span-full flex flex-col gap-2 text-sm">
-                {timelineError && (
-                  <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-red-600">
-                    {timelineError}
-                  </p>
-                )}
-                {timelineSuccess && (
-                  <p className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-600">
-                    {timelineSuccess}
-                  </p>
-                )}
-                <button
-                  type="submit"
-                  disabled={isSavingTimeline}
-                  className="self-start rounded-full bg-brand-500 px-4 py-2 text-xs font-semibold uppercase tracking-wide text-white transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:opacity-70"
-                >
-                  {isSavingTimeline ? "Saving…" : "Save timeline"}
-                </button>
-              </div>
-            </form>
-          </section>
-
-          <section>
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-gray-700">
-                SubTodos ({todo.subtodos?.length ?? 0})
-              </h3>
-            </div>
-            <div className="mt-3 space-y-3">
-              {(todo.subtodos ?? []).length === 0 ? (
-                <p className="text-sm text-gray-500">No subtodos yet.</p>
-              ) : (
-                todo.subtodos?.map((subTodo) => (
-                  <div
-                    key={subTodo.id}
-                    className="flex items-start gap-3 rounded-lg border border-gray-200 bg-gray-50 p-3"
-                  >
-                    <input
-                      type="checkbox"
-                      className="mt-0.5 h-4 w-4 rounded border-gray-300 text-brand-500 focus:ring-brand-500"
-                      checked={subTodo.status === "DONE"}
-                      onChange={(event) =>
-                        handleSubTodoToggle(subTodo, event.target.checked)
-                      }
-                    />
-                    <div className="flex-1">
-                      <p
-                        className={`text-sm font-medium ${
-                          subTodo.status === "DONE"
-                            ? "text-green-600 line-through"
-                            : "text-gray-700"
-                        }`}
-                      >
-                        {subTodo.title}
+                Activity
+                <span className="font-normal text-slate-400">
+                  ({activity.length})
+                </span>
+              </summary>
+              <ol className="space-y-2.5 border-t border-slate-100 px-3 py-3">
+                {activity.map((event) => (
+                  <li key={event.id} className="flex gap-2.5 text-sm">
+                    <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-slate-300" />
+                    <div className="min-w-0">
+                      <p className="break-words text-slate-700">
+                        {event.message}
                       </p>
-                      {subTodo.description && (
-                        <p className="text-xs text-gray-500">
-                          {subTodo.description}
-                        </p>
-                      )}
+                      <p className="text-xs text-slate-400">
+                        {new Date(event.createdAt).toLocaleString()}
+                      </p>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void handleSubTodoDelete(subTodo);
-                      }}
-                      className="rounded-full border border-red-200 px-3 py-1 text-xs font-semibold text-red-500 transition hover:bg-red-50"
-                    >
-                      Delete
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
-            <form
-              className="mt-4 space-y-3 rounded-lg border border-dashed border-gray-300 bg-gray-50 p-3"
-              onSubmit={handleCreateSubTodoSubmit}
-            >
-              <div className="flex items-center justify-between">
-                <h4 className="text-sm font-semibold text-gray-700">
-                  Add Subtodo
-                </h4>
-              </div>
-              <div className="grid gap-2">
-                <input
-                  type="text"
-                  value={subTitle}
-                  onChange={(event) => setSubTitle(event.target.value)}
-                  placeholder="Subtodo title"
-                  className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-                />
-                <textarea
-                  value={subDescription}
-                  onChange={(event) => setSubDescription(event.target.value)}
-                  placeholder="Optional description"
-                  className="rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-                  rows={2}
-                />
-              </div>
-              {createError && (
-                <p className="text-xs text-red-600">{createError}</p>
-              )}
-              <div className="flex justify-end">
-                <button
-                  type="submit"
-                  disabled={isCreatingSubTodo}
-                  className="inline-flex items-center justify-center rounded-md bg-brand-500 px-3 py-1 text-sm font-semibold text-white transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:opacity-70"
-                >
-                  {isCreatingSubTodo ? "Adding..." : "Add Subtodo"}
-                </button>
-              </div>
-            </form>
-          </section>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
         </div>
+
+        {/* Sticky footer: one message area + Discard / Save */}
+        <footer className="pb-safe shrink-0 border-t border-slate-100 bg-slate-50/80 px-5 pt-3 sm:px-6 sm:pb-4">
+          {feedback && (
+            <p
+              role={feedback.kind === "error" ? "alert" : "status"}
+              className={`mb-3 rounded-lg px-3 py-2 text-sm ${
+                feedback.kind === "error"
+                  ? "border border-red-200 bg-red-50 text-red-700"
+                  : "border border-emerald-200 bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {feedback.text}
+            </p>
+          )}
+          <div className="flex items-center gap-3">
+            <span
+              className={`hidden text-xs font-medium sm:block ${
+                isDirty ? "text-amber-600" : "text-slate-400"
+              }`}
+            >
+              {isDirty ? "Unsaved changes" : "All changes saved"}
+            </span>
+            <div className="flex flex-1 items-center gap-2 sm:flex-none sm:justify-end sm:ml-auto">
+              <button
+                type="button"
+                onClick={handleDiscard}
+                disabled={!isDirty || isSaving}
+                className="btn-secondary flex-1 sm:flex-none"
+              >
+                Discard
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSave()}
+                disabled={!isDirty || isSaving}
+                className="btn-primary flex-1 sm:flex-none"
+                title="Save (Ctrl/⌘ + Enter)"
+              >
+                {isSaving ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </footer>
       </div>
     </div>
+  );
+}
+
+interface ChecklistItemProps {
+  item: Todo;
+  onToggle: (item: Todo, checked: boolean) => Promise<void>;
+  onRename: (item: Todo, title: string) => Promise<void>;
+  onDelete: (item: Todo) => Promise<void>;
+}
+
+/** One checklist step: checkbox, inline-editable name, delete. */
+function ChecklistItem({
+  item,
+  onToggle,
+  onRename,
+  onDelete,
+}: ChecklistItemProps) {
+  const isDone = item.status === "DONE";
+  const isPending = item.id < 0;
+  const [isEditing, setIsEditing] = useState(false);
+  const [value, setValue] = useState(item.title);
+  // Set when Esc/Enter already finished the edit, so the blur that follows
+  // doesn't save again.
+  const finishedRef = useRef(false);
+
+  const startEditing = () => {
+    if (isPending) return;
+    finishedRef.current = false;
+    setValue(item.title);
+    setIsEditing(true);
+  };
+
+  const commit = () => {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
+    setIsEditing(false);
+    const title = value.trim();
+    if (title && title !== item.title) void onRename(item, title);
+  };
+
+  const cancel = () => {
+    finishedRef.current = true;
+    setIsEditing(false);
+    setValue(item.title);
+  };
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter" && !event.metaKey && !event.ctrlKey) {
+      event.preventDefault();
+      commit();
+    } else if (event.key === "Escape") {
+      // Keep the modal open: only leave edit mode.
+      event.preventDefault();
+      event.nativeEvent.stopImmediatePropagation();
+      cancel();
+    }
+  };
+
+  return (
+    <li className="group/step flex items-center gap-3 bg-white px-3 py-1.5">
+      <input
+        type="checkbox"
+        className="h-5 w-5 shrink-0 cursor-pointer rounded border-slate-300 accent-brand-500 disabled:cursor-default"
+        checked={isDone}
+        disabled={isPending}
+        onChange={(event) => void onToggle(item, event.target.checked)}
+        aria-label={`Mark ${item.title} as done`}
+      />
+      {isEditing ? (
+        <input
+          type="text"
+          autoFocus
+          onFocus={(event) => event.target.select()}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          onBlur={commit}
+          onKeyDown={onKeyDown}
+          aria-label="Tên bước"
+          className="min-w-0 flex-1 rounded-md border border-brand-300 px-2 py-1 text-base text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500/30 sm:text-sm"
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={startEditing}
+          className={`min-w-0 flex-1 cursor-text break-words py-1 text-left text-sm ${
+            isDone ? "text-slate-400 line-through" : "text-slate-800"
+          }`}
+          title="Bấm để sửa tên"
+        >
+          {item.title}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => void onDelete(item)}
+        disabled={isPending}
+        className="icon-btn h-8 w-8 shrink-0 hover:bg-red-50 hover:text-red-600 md:opacity-0 md:focus:opacity-100 md:group-hover/step:opacity-100"
+        aria-label={`Delete ${item.title}`}
+      >
+        <TrashIcon width={15} height={15} />
+      </button>
+    </li>
   );
 }

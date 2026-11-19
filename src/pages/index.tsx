@@ -9,7 +9,7 @@ import {
 import {
   closestCorners,
   DndContext,
-  PointerSensor,
+  MouseSensor,
   defaultDropAnimation,
   useSensor,
   useSensors,
@@ -18,7 +18,7 @@ import {
 } from "@dnd-kit/core";
 import { useRouter } from "next/router";
 
-import type { ApiError, Todo } from "../services/api";
+import type { ApiError, Todo, TodoChanges } from "../services/api";
 import {
   createTodo,
   fetchTodos,
@@ -26,14 +26,27 @@ import {
   updateTodoStatusesBatch,
   getAuthToken,
   API_URL,
-  updateTodo,
-  updateTodoWithImage,
+  saveTodo,
   deleteTodo,
 } from "../services/api";
 import type { TodoFormValues } from "../components/TodoItem";
 import KanbanColumn from "../components/KanbanColumn";
 import DraggableTodoCard from "../components/DraggableTodoCard";
+import { STATUS_META } from "../components/status";
+import {
+  AlertIcon,
+  BoardIcon,
+  ChevronIcon,
+  DownloadIcon,
+  LogoMark,
+  LogoutIcon,
+  PlusIcon,
+  RepeatIcon,
+  SearchIcon,
+  XIcon,
+} from "../components/icons";
 import TodoDetailsModal from "../components/TodoDetailsModal";
+import RoutinesView from "../components/RoutinesView";
 import {
   enqueueOperation,
   consumeQueue,
@@ -65,15 +78,23 @@ const initialRootForm: RootFormState = {
 };
 
 const LOCAL_CACHE_KEY = "todo_cached_todos_v1";
+const VIEW_STORAGE_KEY = "todo_view_v1";
+
+type AppView = "board" | "routines";
+
+const VIEWS: Array<{ id: AppView; label: string }> = [
+  { id: "board", label: "Board" },
+  { id: "routines", label: "Routines" },
+];
 
 const STATUS_COLUMNS: Array<{
   id: Todo["status"];
   title: string;
-  accentClass: string;
+  shortTitle: string;
 }> = [
-  { id: "TODO", title: "Todo", accentClass: "text-gray-500" },
-  { id: "IN_PROGRESS", title: "In Progress", accentClass: "text-yellow-600" },
-  { id: "DONE", title: "Done", accentClass: "text-green-600" },
+  { id: "TODO", title: "Todo", shortTitle: "Todo" },
+  { id: "IN_PROGRESS", title: "In Progress", shortTitle: "Doing" },
+  { id: "DONE", title: "Done", shortTitle: "Done" },
 ];
 
 const cloneTodos = (list: Todo[]): Todo[] =>
@@ -95,7 +116,7 @@ const removeTodoFromTree = (list: Todo[], targetId: number): Todo[] =>
 const addSubTodoToParent = (
   list: Todo[],
   parentId: number,
-  subTodo: Todo
+  subTodo: Todo,
 ): Todo[] =>
   list.map((todo) => {
     if (todo.id === parentId) {
@@ -130,7 +151,7 @@ const upsertTodoInTree = (list: Todo[], updated: Todo): Todo[] =>
 const applyStatusToList = (
   list: Todo[],
   targetId: number,
-  status: Todo["status"]
+  status: Todo["status"],
 ): Todo[] =>
   list.map((todo) => {
     if (todo.id === targetId) {
@@ -157,7 +178,7 @@ const applyStatusToList = (
                 ...sub,
                 status,
               }
-            : sub
+            : sub,
         ),
       };
     }
@@ -165,27 +186,9 @@ const applyStatusToList = (
     return todo;
   });
 
-const applyMetaToList = (
-  list: Todo[],
-  targetId: number,
-  updates: Partial<
-    Pick<Todo, "title" | "description" | "startDate" | "endDate">
-  >
-): Todo[] =>
-  list.map((todo) => {
-    if (todo.id === targetId) {
-      return { ...todo, ...updates };
-    }
-    if (todo.subtodos?.length) {
-      return {
-        ...todo,
-        subtodos: applyMetaToList(todo.subtodos, targetId, updates),
-      };
-    }
-    return todo;
-  });
-
 const STATUS_QUEUE_STORAGE_KEY = "todo_status_queue_v1";
+// How long to wait after the last status change before syncing the batch.
+const STATUS_SYNC_DELAY_MS = 800;
 
 interface StatusUpdateRequest {
   todoId: number;
@@ -249,7 +252,7 @@ const normalizeTodo = (input: any): Todo => {
     parentId:
       typeof input.parentId === "number"
         ? input.parentId
-        : input.parentId ?? null,
+        : (input.parentId ?? null),
     imageUrl: input.imageUrl ?? undefined,
     startDate: input.startDate ?? undefined,
     endDate: input.endDate ?? undefined,
@@ -272,7 +275,7 @@ const normalizeTodo = (input: any): Todo => {
           actorUserId:
             typeof event.actorUserId === "number"
               ? event.actorUserId
-              : event.actorUserId ?? null,
+              : (event.actorUserId ?? null),
           createdAt:
             typeof event.createdAt === "string"
               ? event.createdAt
@@ -282,14 +285,6 @@ const normalizeTodo = (input: any): Todo => {
   };
 
   return normalized;
-};
-
-const normalizeDateInput = (value: string | null): string | null => {
-  if (!value) {
-    return null;
-  }
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toISOString();
 };
 
 export default function HomePage() {
@@ -307,6 +302,31 @@ export default function HomePage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedTodoId, setSelectedTodoId] = useState<number | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showMoreOptions, setShowMoreOptions] = useState(false);
+  const [activeTab, setActiveTab] = useState<Todo["status"]>("TODO");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [view, setView] = useState<AppView>("board");
+  const [routinesRefreshKey, setRoutinesRefreshKey] = useState(0);
+  const [routineCreateSignal, setRoutineCreateSignal] = useState(0);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(VIEW_STORAGE_KEY);
+      if (stored === "board" || stored === "routines") setView(stored);
+    } catch {
+      // storage unavailable; keep default view
+    }
+  }, []);
+
+  const changeView = useCallback((next: AppView) => {
+    setView(next);
+    try {
+      window.localStorage.setItem(VIEW_STORAGE_KEY, next);
+    } catch {
+      // ignore
+    }
+    window.scrollTo({ top: 0 });
+  }, []);
 
   const [installPromptEvent, setInstallPromptEvent] =
     useState<DeferredPromptEvent | null>(null);
@@ -333,12 +353,12 @@ export default function HomePage() {
       htmlOverflow: html.style.overflow,
       htmlTouchAction: html.style.getPropertyValue("touch-action"),
       htmlOverscrollBehavior: html.style.getPropertyValue(
-        "overscroll-behavior"
+        "overscroll-behavior",
       ),
       bodyOverflow: body.style.overflow,
       bodyTouchAction: body.style.getPropertyValue("touch-action"),
       bodyOverscrollBehavior: body.style.getPropertyValue(
-        "overscroll-behavior"
+        "overscroll-behavior",
       ),
     };
 
@@ -367,7 +387,7 @@ export default function HomePage() {
     if (previous.htmlOverscrollBehavior) {
       html.style.setProperty(
         "overscroll-behavior",
-        previous.htmlOverscrollBehavior
+        previous.htmlOverscrollBehavior,
       );
     } else {
       html.style.removeProperty("overscroll-behavior");
@@ -382,7 +402,7 @@ export default function HomePage() {
     if (previous.bodyOverscrollBehavior) {
       body.style.setProperty(
         "overscroll-behavior",
-        previous.bodyOverscrollBehavior
+        previous.bodyOverscrollBehavior,
       );
     } else {
       body.style.removeProperty("overscroll-behavior");
@@ -410,7 +430,7 @@ export default function HomePage() {
         return next;
       });
     },
-    [persistTodos]
+    [persistTodos],
   );
 
   const loadTodos = useCallback(async () => {
@@ -465,13 +485,13 @@ export default function HomePage() {
         if (operation.type === "createTodo") {
           const formData = buildFormData(
             operation.payload.values,
-            operation.payload.parentId ?? undefined
+            operation.payload.parentId ?? undefined,
           );
           await createTodo(formData);
         } else if (operation.type === "updateStatus") {
           await updateTodoStatus(
             operation.payload.id,
-            operation.payload.status
+            operation.payload.status,
           );
         }
         hasProcessed = true;
@@ -518,7 +538,7 @@ export default function HomePage() {
       setInstallPromptEvent(null);
       setIsInstallAvailable(false);
       setInstallMessage(
-        "App installed! You can launch it from your home screen."
+        "App installed! You can launch it from your home screen.",
       );
     };
 
@@ -541,7 +561,7 @@ export default function HomePage() {
       setIsInstallAvailable(false);
       if (choice.outcome === "accepted") {
         setInstallMessage(
-          "Install started. Check your device to finish adding the app."
+          "Install started. Check your device to finish adding the app.",
         );
       } else {
         setInstallMessage("Install dismissed. You can try again later.");
@@ -560,8 +580,19 @@ export default function HomePage() {
   }, [releaseScrollLock]);
 
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+    // Mouse only: on touch/mobile, cards change status via buttons instead.
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
   );
+
+  const [isMobile, setIsMobile] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const query = window.matchMedia("(max-width: 767px), (pointer: coarse)");
+    const update = () => setIsMobile(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
   useEffect(() => {
     todosRef.current = cloneTodos(todos);
   }, [todos]);
@@ -572,7 +603,7 @@ export default function HomePage() {
       duration: 250,
       easing: "cubic-bezier(0.22, 1, 0.36, 1)",
     }),
-    []
+    [],
   );
 
   const statusQueueRef = useRef<StatusUpdateRequest[]>([]);
@@ -585,7 +616,7 @@ export default function HomePage() {
     }));
     window.localStorage.setItem(
       STATUS_QUEUE_STORAGE_KEY,
-      JSON.stringify(serialized)
+      JSON.stringify(serialized),
     );
   }, []);
 
@@ -671,7 +702,7 @@ export default function HomePage() {
             case "status_batch":
               if (Array.isArray(payload.todos)) {
                 const normalized = payload.todos.map((todo) =>
-                  normalizeTodo(todo)
+                  normalizeTodo(todo),
                 );
                 updateTodosState((prev) => {
                   let next = cloneTodos(prev);
@@ -692,6 +723,9 @@ export default function HomePage() {
                   return next;
                 });
               }
+              break;
+            case "routines":
+              setRoutinesRefreshKey((value) => value + 1);
               break;
             default:
               break;
@@ -806,7 +840,7 @@ export default function HomePage() {
       } else {
         updateTodosState((prev) => removeTodoFromTree(prev, tempId));
         setFormError(
-          err instanceof Error ? err.message : "Failed to create todo"
+          err instanceof Error ? err.message : "Failed to create todo",
         );
       }
     } finally {
@@ -842,7 +876,7 @@ export default function HomePage() {
       };
 
       updateTodosState((prev) =>
-        addSubTodoToParent(prev, parent.id, optimisticSubTodo)
+        addSubTodoToParent(prev, parent.id, optimisticSubTodo),
       );
 
       try {
@@ -867,29 +901,29 @@ export default function HomePage() {
         } else {
           updateTodosState((prev) => removeTodoFromTree(prev, tempId));
           setError(
-            err instanceof Error ? err.message : "Failed to create subtodo"
+            err instanceof Error ? err.message : "Failed to create subtodo",
           );
         }
       }
     },
-    [loadTodos, updateTodosState]
+    [loadTodos, updateTodosState],
   );
 
   const applyLocalStatusChange = useCallback(
     (targetId: number, status: Todo["status"]) => {
       updateTodosState((prev) => applyStatusToList(prev, targetId, status));
     },
-    [updateTodosState]
+    [updateTodosState],
   );
 
   const enqueueStatusUpdate = useCallback(
     (todoId: number, status: Todo["status"], snapshot: Todo[]) => {
       const existing = statusQueueRef.current.find(
-        (item) => item.todoId === todoId
+        (item) => item.todoId === todoId,
       );
       const snapshotToStore = existing ? existing.snapshot : snapshot;
       statusQueueRef.current = statusQueueRef.current.filter(
-        (item) => item.todoId !== todoId
+        (item) => item.todoId !== todoId,
       );
       statusQueueRef.current.push({
         todoId,
@@ -898,10 +932,10 @@ export default function HomePage() {
       });
       persistStatusQueue();
     },
-    [persistStatusQueue]
+    [persistStatusQueue],
   );
 
-  const flushPendingStatusQueue = useCallback(
+  const flushStatusQueueOnce = useCallback(
     async ({ keepalive = false }: { keepalive?: boolean } = {}) => {
       if (statusQueueRef.current.length === 0) {
         return true;
@@ -914,11 +948,27 @@ export default function HomePage() {
 
       try {
         await updateTodoStatusesBatch(payload, { keepalive });
-        const ids = payload.map((item) => item.id);
-        statusQueueRef.current = [];
+        // Only drop what was actually sent: a change made while this request
+        // was in flight stays queued for the next flush.
+        statusQueueRef.current = statusQueueRef.current.filter(
+          (item) =>
+            !payload.some(
+              (sent) => sent.id === item.todoId && sent.status === item.status,
+            ),
+        );
         persistStatusQueue();
+        // Keep the statuses the server just accepted. An SSE event built
+        // before the write may have arrived first with the old status.
+        const stillQueued = new Set(
+          statusQueueRef.current.map((item) => item.todoId),
+        );
         updateTodosState((prev) =>
-          ids.reduce((acc, id) => applyStatusToList(acc, id, "TODO"), prev)
+          payload
+            .filter((item) => !stillQueued.has(item.id))
+            .reduce(
+              (acc, item) => applyStatusToList(acc, item.id, item.status),
+              prev,
+            ),
         );
         if (!keepalive) {
           setError(null);
@@ -936,14 +986,59 @@ export default function HomePage() {
             setError(
               err instanceof Error
                 ? err.message
-                : "Failed to sync pending status updates"
+                : "Failed to sync pending status updates",
             );
           }
         }
         return false;
       }
     },
-    [logout, persistStatusQueue, router, updateTodosState]
+    [logout, persistStatusQueue, router, updateTodosState],
+  );
+
+  // pagehide + visibilitychange (and online) can fire together; share one
+  // in-flight request instead of sending the same batch twice.
+  const flushInFlightRef = useRef<Promise<boolean> | null>(null);
+
+  const flushPendingStatusQueue = useCallback(
+    ({ keepalive = false }: { keepalive?: boolean } = {}) => {
+      if (flushInFlightRef.current) return flushInFlightRef.current;
+      const run = flushStatusQueueOnce({ keepalive }).finally(() => {
+        flushInFlightRef.current = null;
+      });
+      flushInFlightRef.current = run;
+      return run;
+    },
+    [flushStatusQueueOnce],
+  );
+
+  // Status changes are batched: each change (re)starts a short timer, and when
+  // it fires everything queued so far goes out in one request. Leaving the page
+  // (pagehide) and coming back online still flush immediately.
+  const statusSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const scheduleStatusSync = useCallback(() => {
+    if (statusSyncTimerRef.current) {
+      clearTimeout(statusSyncTimerRef.current);
+    }
+    statusSyncTimerRef.current = setTimeout(async () => {
+      statusSyncTimerRef.current = null;
+      // A request already in flight doesn't include changes made after it
+      // started, so wait for it, then send whatever is still queued.
+      await flushInFlightRef.current?.catch(() => false);
+      await flushPendingStatusQueue();
+    }, STATUS_SYNC_DELAY_MS);
+  }, [flushPendingStatusQueue]);
+
+  useEffect(
+    () => () => {
+      if (statusSyncTimerRef.current) {
+        clearTimeout(statusSyncTimerRef.current);
+      }
+    },
+    [],
   );
 
   const handleUpdateStatus = useCallback(
@@ -952,7 +1047,7 @@ export default function HomePage() {
 
       if (todo.id < 0) {
         setError(
-          "Please wait for this todo to sync before updating its status."
+          "Please wait for this todo to sync before updating its status.",
         );
         return;
       }
@@ -969,16 +1064,18 @@ export default function HomePage() {
           payload: { id: todo.id, status },
         });
         setError("Offline mode: status change queued for sync.");
+      } else {
+        scheduleStatusSync();
       }
     },
-    [applyLocalStatusChange, enqueueStatusUpdate]
+    [applyLocalStatusChange, enqueueStatusUpdate, scheduleStatusSync],
   );
 
   const handleDeleteTodo = useCallback(
     async (target: Todo) => {
       const snapshot = cloneTodos(todosRef.current);
       statusQueueRef.current = statusQueueRef.current.filter(
-        (item) => item.todoId !== target.id
+        (item) => item.todoId !== target.id,
       );
       persistStatusQueue();
       updateTodosState((prev) => removeTodoFromTree(prev, target.id));
@@ -986,7 +1083,7 @@ export default function HomePage() {
         await deleteTodo(target.id);
         setError(null);
         setSelectedTodoId((current) =>
-          current === target.id ? null : current
+          current === target.id ? null : current,
         );
       } catch (err) {
         updateTodosState(() => snapshot);
@@ -996,14 +1093,14 @@ export default function HomePage() {
         throw err instanceof Error ? err : new Error(message);
       }
     },
-    [deleteTodo, persistStatusQueue, updateTodosState]
+    [deleteTodo, persistStatusQueue, updateTodosState],
   );
 
   const handleDeleteSubTodo = useCallback(
     async (subTodo: Todo) => {
       const snapshot = cloneTodos(todosRef.current);
       statusQueueRef.current = statusQueueRef.current.filter(
-        (item) => item.todoId !== subTodo.id
+        (item) => item.todoId !== subTodo.id,
       );
       persistStatusQueue();
       updateTodosState((prev) => removeTodoFromTree(prev, subTodo.id));
@@ -1018,153 +1115,26 @@ export default function HomePage() {
         throw err instanceof Error ? err : new Error(message);
       }
     },
-    [deleteTodo, persistStatusQueue, updateTodosState]
+    [deleteTodo, persistStatusQueue, updateTodosState],
   );
 
-  const handleUpdateDetails = useCallback(
-    async (
-      target: Todo,
-      values: { title: string; description: string | null }
-    ) => {
-      const snapshot = cloneTodos(todosRef.current);
-      updateTodosState((prev) =>
-        applyMetaToList(prev, target.id, {
-          title: values.title,
-          description: values.description,
-        })
-      );
-
-      try {
-        const updated = await updateTodo(target.id, {
-          title: values.title,
-          description: values.description,
-        });
-        const normalized = normalizeTodo(updated);
-        updateTodosState((prev) => upsertTodoInTree(prev, normalized));
-        setError(null);
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Failed to update todo";
-        setError(message);
-        updateTodosState(() => snapshot);
-        throw err instanceof Error ? err : new Error(message);
-      }
+  // Single "Save" for the todo detail form: one PATCH with every changed field.
+  // Not optimistic and not queued offline: the modal keeps its draft on error.
+  const handleSaveTodo = useCallback(
+    async (target: Todo, changes: TodoChanges): Promise<Todo> => {
+      const updated = await saveTodo(target.id, changes);
+      const normalized = normalizeTodo(updated);
+      updateTodosState((prev) => upsertTodoInTree(prev, normalized));
+      return normalized;
     },
-    [setError, updateTodo, updateTodosState]
+    [updateTodosState],
   );
 
-  const handleUpdateTimeline = useCallback(
-    async (
-      target: Todo,
-      values: { startDate: string | null; endDate: string | null }
-    ) => {
-      const snapshot = cloneTodos(todosRef.current);
-      const payload = {
-        startDate: normalizeDateInput(values.startDate),
-        endDate: normalizeDateInput(values.endDate),
-      };
-
-      updateTodosState((prev) =>
-        applyMetaToList(prev, target.id, {
-          startDate: normalizeDateInput(values.startDate),
-          endDate: normalizeDateInput(values.endDate),
-        })
-      );
-
-      try {
-        const updated = await updateTodo(target.id, payload);
-        const normalized = normalizeTodo(updated);
-        updateTodosState((prev) => upsertTodoInTree(prev, normalized));
-        setError(null);
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Failed to update timeline";
-        setError(message);
-        updateTodosState(() => snapshot);
-        throw err instanceof Error ? err : new Error(message);
-      }
+  const handleRenameSubTodo = useCallback(
+    async (subTodo: Todo, title: string) => {
+      await handleSaveTodo(subTodo, { title });
     },
-    [updateTodo, updateTodosState]
-  );
-
-  const handleUpdateImage = useCallback(
-    async (target: Todo, imageFile: File | null) => {
-      const snapshot = cloneTodos(todosRef.current);
-
-      // Optimistically update
-      if (imageFile) {
-        const tempUrl = URL.createObjectURL(imageFile);
-        updateTodosState((prev) =>
-          prev.map((t) => {
-            if (t.id === target.id) {
-              return { ...t, imageUrl: tempUrl };
-            }
-            if (t.subtodos?.some((st) => st.id === target.id)) {
-              return {
-                ...t,
-                subtodos: t.subtodos.map((st) =>
-                  st.id === target.id ? { ...st, imageUrl: tempUrl } : st
-                ),
-              };
-            }
-            return t;
-          })
-        );
-      } else {
-        // Optimistically remove image
-        updateTodosState((prev) =>
-          prev.map((t) => {
-            if (t.id === target.id) {
-              return { ...t, imageUrl: null };
-            }
-            if (t.subtodos?.some((st) => st.id === target.id)) {
-              return {
-                ...t,
-                subtodos: t.subtodos.map((st) =>
-                  st.id === target.id ? { ...st, imageUrl: null } : st
-                ),
-              };
-            }
-            return t;
-          })
-        );
-      }
-
-      try {
-        const formData = new FormData();
-        // Keep existing title and description
-        formData.append("title", target.title);
-        if (target.description) {
-          formData.append("description", target.description);
-        }
-
-        if (imageFile) {
-          formData.append("image", imageFile);
-        } else {
-          // Send empty string to indicate image removal
-          formData.append("imageUrl", "");
-        }
-
-        const updated = await updateTodoWithImage(target.id, formData);
-        const normalized = normalizeTodo(updated);
-
-        // Clean up temporary URL if it was created
-        if (imageFile) {
-          const tempUrl = URL.createObjectURL(imageFile);
-          URL.revokeObjectURL(tempUrl);
-        }
-
-        updateTodosState((prev) => upsertTodoInTree(prev, normalized));
-        setError(null);
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Failed to update image";
-        setError(message);
-        updateTodosState(() => snapshot);
-        throw err instanceof Error ? err : new Error(message);
-      }
-    },
-    [updateTodosState]
+    [handleSaveTodo],
   );
 
   useEffect(() => {
@@ -1205,25 +1175,12 @@ export default function HomePage() {
     };
   }, [flushPendingStatusQueue]);
 
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const handleOnline = () => {
-      void flushPendingStatusQueue();
-    };
-
-    window.addEventListener("online", handleOnline);
-    return () => {
-      window.removeEventListener("online", handleOnline);
-    };
-  }, [flushPendingStatusQueue]);
-
   const handleToggleSubTodo = useCallback(
     async (subTodo: Todo, completed: boolean) => {
       const targetStatus: Todo["status"] = completed ? "DONE" : "TODO";
       await handleUpdateStatus(subTodo, targetStatus);
     },
-    [handleUpdateStatus]
+    [handleUpdateStatus],
   );
 
   const handleDragStart = useCallback(() => {
@@ -1241,7 +1198,7 @@ export default function HomePage() {
         eventSourceRef.current = null;
       }
     },
-    []
+    [],
   );
 
   const handleDragEnd = useCallback(
@@ -1263,7 +1220,7 @@ export default function HomePage() {
         // Already handled in handleUpdateStatus
       }
     },
-    [handleUpdateStatus, releaseScrollLock]
+    [handleUpdateStatus, releaseScrollLock],
   );
 
   const groupedTodos = useMemo(() => {
@@ -1282,20 +1239,70 @@ export default function HomePage() {
   const selectedTodo = useMemo(
     () =>
       selectedTodoId != null
-        ? todos.find((todo) => todo.id === selectedTodoId) ?? null
+        ? (todos.find((todo) => todo.id === selectedTodoId) ?? null)
         : null,
-    [todos, selectedTodoId]
+    [todos, selectedTodoId],
   );
 
-  const heading = useMemo(() => {
-    if (isLoading) return "Loading your board...";
-    if (todos.length === 0) return "Start planning with your first todo";
-    return "Todo Board";
-  }, [isLoading, todos.length]);
+  const visibleTodos = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return groupedTodos;
+    const matches = (todo: Todo) =>
+      todo.title.toLowerCase().includes(query) ||
+      (todo.description ?? "").toLowerCase().includes(query) ||
+      (todo.subtodos ?? []).some((sub) =>
+        sub.title.toLowerCase().includes(query),
+      );
+    return {
+      TODO: groupedTodos.TODO.filter(matches),
+      IN_PROGRESS: groupedTodos.IN_PROGRESS.filter(matches),
+      DONE: groupedTodos.DONE.filter(matches),
+    };
+  }, [groupedTodos, searchQuery]);
+
+  const stats = useMemo(() => {
+    const total = todos.length;
+    const done = groupedTodos.DONE.length;
+    return {
+      total,
+      done,
+      inProgress: groupedTodos.IN_PROGRESS.length,
+      percent: total ? Math.round((done / total) * 100) : 0,
+    };
+  }, [groupedTodos, todos.length]);
+
+  const isAnyModalOpen = showCreateModal || selectedTodo != null;
+
+  // Prevent the board from scrolling behind open modals (important on iOS).
+  useEffect(() => {
+    if (typeof document === "undefined" || !isAnyModalOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [isAnyModalOpen]);
+
+  const closeCreateModal = useCallback(() => {
+    setShowCreateModal(false);
+    setShowMoreOptions(false);
+    setFormState(initialRootForm);
+    setFormError(null);
+  }, []);
+
+  useEffect(() => {
+    if (!showCreateModal) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeCreateModal();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeCreateModal, showCreateModal]);
 
   if (isAuthLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-gray-100 text-sm text-gray-500">
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-slate-50 text-sm text-slate-500">
+        <LogoMark className="h-10 w-10 animate-pulse" />
         Loading your workspace...
       </div>
     );
@@ -1305,270 +1312,548 @@ export default function HomePage() {
     return null;
   }
 
+  const displayName = user?.name || user?.email || "there";
+  const initials = displayName
+    .split(/[\s@.]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("");
+
+  const renderSkeleton = () =>
+    Array.from({ length: 2 }).map((_, index) => (
+      <div
+        key={index}
+        className="h-28 animate-pulse rounded-xl border border-slate-200/60 bg-white/70"
+      />
+    ));
+
   return (
-    <div className="min-h-screen bg-gray-100">
-      <div className="mx-auto max-w-6xl px-4 py-8">
-        <nav className="mb-6 flex items-center justify-between rounded-2xl bg-white/80 px-6 py-4 shadow">
-          <div>
-            <p className="text-xs uppercase tracking-widest text-brand-500">
-              Todo App
+    <div className="min-h-screen bg-slate-50 pb-40 md:pb-10">
+      {/* Top bar */}
+      <header className="sticky top-0 z-30 border-b border-slate-200/70 bg-white/80 backdrop-blur-lg">
+        <div className="mx-auto flex h-14 max-w-7xl items-center gap-3 px-4 md:h-16 md:px-6">
+          <LogoMark className="h-8 w-8 shrink-0" />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-sm font-semibold text-slate-900 md:text-base">
+              {view === "board" ? "Todo Board" : "Routines"}
             </p>
-            <h1 className="text-lg font-semibold text-gray-900">
-              Hello, {user?.name || user?.email}
-            </h1>
+            <p className="truncate text-xs text-slate-500">
+              Hello, {displayName}
+            </p>
           </div>
-          <div className="flex items-center gap-3">
-            {isInstallAvailable && (
+
+          <div
+            role="tablist"
+            aria-label="Views"
+            className="hidden items-center gap-1 rounded-full bg-slate-100 p-1 md:flex"
+          >
+            {VIEWS.map((item) => (
               <button
+                key={item.id}
                 type="button"
-                onClick={handleInstallPwa}
-                className="rounded-full bg-brand-500 px-4 py-2 text-xs font-semibold text-white shadow transition hover:bg-brand-500/90"
+                role="tab"
+                aria-selected={view === item.id}
+                onClick={() => changeView(item.id)}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3.5 py-1.5 text-sm font-semibold transition ${
+                  view === item.id
+                    ? "bg-white text-slate-900 shadow-sm"
+                    : "text-slate-500 hover:text-slate-800"
+                }`}
               >
-                Install app
+                {item.id === "board" ? (
+                  <BoardIcon width={15} height={15} />
+                ) : (
+                  <RepeatIcon width={15} height={15} />
+                )}
+                {item.label}
               </button>
-            )}
+            ))}
+          </div>
+
+          <div
+            className={`relative hidden w-64 lg:w-72 ${
+              view === "board" ? "md:block" : ""
+            }`}
+          >
+            <SearchIcon className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Search todos…"
+              className="field rounded-full py-2 pl-10"
+            />
+          </div>
+
+          {isInstallAvailable && (
+            <button
+              type="button"
+              onClick={handleInstallPwa}
+              className="btn-secondary px-3 py-2"
+              title="Install app"
+            >
+              <DownloadIcon width={16} height={16} />
+              <span className="hidden sm:inline">Install</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setShowCreateModal(true)}
+            className={`btn-primary hidden ${
+              view === "board" ? "md:inline-flex" : ""
+            }`}
+          >
+            <PlusIcon width={16} height={16} />
+            New todo
+          </button>
+          <div className="flex items-center gap-1">
+            <span
+              className="hidden h-9 w-9 items-center justify-center rounded-full bg-brand-100 text-xs font-bold text-brand-700 sm:inline-flex"
+              title={user?.email}
+            >
+              {initials || "U"}
+            </span>
             <button
               type="button"
               onClick={() => logout()}
-              className="rounded-full border border-gray-200 px-4 py-2 text-xs font-medium text-gray-600 transition hover:border-brand-500 hover:text-brand-500"
+              className="icon-btn"
+              aria-label="Log out"
+              title="Log out"
             >
-              Log out
+              <LogoutIcon />
             </button>
           </div>
-        </nav>
+        </div>
+      </header>
 
-        <header className="mb-8 text-center">
-          <h2 className="text-3xl font-bold text-gray-900 md:text-4xl">
-            {heading}
-          </h2>
-          <p className="mt-2 text-gray-600">
-            Organise todos, collaborate with subtasks, and track progress with
-            timelines.
-          </p>
-          {installMessage && (
-            <p className="mt-3 text-sm text-brand-500">{installMessage}</p>
-          )}
-        </header>
-
-        {error && (
-          <div className="mb-6 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-            {error}
-          </div>
-        )}
-
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCorners}
-          onDragStart={handleDragStart}
-          onDragCancel={handleDragCancel}
-          onDragEnd={handleDragEnd}
-        >
-          <div className="grid gap-4 md:grid-cols-3">
-            {STATUS_COLUMNS.map((column) => (
-              <KanbanColumn
-                key={column.id}
-                id={column.id}
-                title={column.title}
-                subtitle={`${groupedTodos[column.id].length} tasks`}
-                accentClass={column.accentClass}
-              >
-                {column.id === "TODO" && (
-                  <button
-                    type="button"
-                    onClick={() => setShowCreateModal(true)}
-                    className="flex w-full items-center justify-center rounded-xl border border-dashed border-gray-300 bg-gray-50 py-10 text-sm font-medium text-gray-500 transition hover:border-brand-500 hover:text-brand-500"
-                  >
-                    + Add new todo
-                  </button>
-                )}
-                {groupedTodos[column.id].map((todo) => (
-                  <DraggableTodoCard
-                    key={todo.id}
-                    todo={todo}
-                    onUpdateStatus={handleUpdateStatus}
-                    onViewDetails={(item) => setSelectedTodoId(item.id)}
-                    onToggleSubTodo={handleToggleSubTodo}
-                    onDeleteTodo={handleDeleteTodo}
-                    onDeleteSubTodo={handleDeleteSubTodo}
+      <main className="mx-auto max-w-7xl px-4 pt-5 md:px-6 md:pt-8">
+        {view === "routines" ? (
+          <RoutinesView
+            refreshKey={routinesRefreshKey}
+            createSignal={routineCreateSignal}
+          />
+        ) : (
+          <>
+            {/* Overview */}
+            <section className="mb-4 grid gap-4 md:mb-6 md:grid-cols-4">
+              <div className="panel p-4 md:p-5">
+                <div className="flex items-baseline justify-between">
+                  <p className="text-sm font-medium text-slate-500">Progress</p>
+                  <p className="text-2xl font-bold tabular-nums text-slate-900">
+                    {stats.percent}%
+                  </p>
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-brand-400 to-emerald-500 transition-all duration-500"
+                    style={{ width: `${stats.percent}%` }}
                   />
-                ))}
-              </KanbanColumn>
-            ))}
-          </div>
-        </DndContext>
-      </div>
+                </div>
+                <p className="mt-2 text-xs text-slate-500">
+                  {stats.done} of {stats.total} todos completed
+                </p>
+              </div>
+              {STATUS_COLUMNS.map((column) => (
+                <div key={column.id} className="panel hidden p-5 md:block">
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className={`h-2 w-2 rounded-full ${STATUS_META[column.id].dot}`}
+                    />
+                    <p className="truncate text-sm font-medium text-slate-500">
+                      {column.title}
+                    </p>
+                  </div>
+                  <p className="mt-2 text-2xl font-bold tabular-nums text-slate-900">
+                    {groupedTodos[column.id].length}
+                  </p>
+                </div>
+              ))}
+            </section>
+
+            {installMessage && (
+              <p className="mb-4 rounded-xl border border-brand-100 bg-brand-50 px-4 py-3 text-sm text-brand-700">
+                {installMessage}
+              </p>
+            )}
+
+            {error && (
+              <div
+                role="alert"
+                className="mb-4 flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800"
+              >
+                <AlertIcon className="mt-0.5 shrink-0" />
+                <p className="flex-1">{error}</p>
+                <button
+                  type="button"
+                  onClick={() => setError(null)}
+                  className="-m-1 rounded p-1 text-amber-700 hover:bg-amber-100"
+                  aria-label="Dismiss"
+                >
+                  <XIcon width={16} height={16} />
+                </button>
+              </div>
+            )}
+
+            {/* Mobile: search + status tabs */}
+            <div className="sticky top-14 z-20 -mx-4 mb-3 space-y-3 bg-slate-50/90 px-4 pb-3 pt-1 backdrop-blur md:hidden">
+              <div className="relative">
+                <SearchIcon className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="Search todos…"
+                  className="field rounded-full pl-10"
+                />
+              </div>
+              <div
+                role="tablist"
+                className="grid grid-cols-3 gap-1 rounded-xl bg-slate-200/70 p-1"
+              >
+                {STATUS_COLUMNS.map((column) => {
+                  const isActive = activeTab === column.id;
+                  return (
+                    <button
+                      key={column.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={isActive}
+                      onClick={() => setActiveTab(column.id)}
+                      className={`flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-[13px] font-semibold transition ${
+                        isActive
+                          ? "bg-white text-slate-900 shadow-sm"
+                          : "text-slate-500"
+                      }`}
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${STATUS_META[column.id].dot}`}
+                      />
+                      <span className="truncate">{column.shortTitle}</span>
+                      <span className="tabular-nums text-slate-400">
+                        {visibleTodos[column.id].length}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCorners}
+              onDragStart={handleDragStart}
+              onDragCancel={handleDragCancel}
+              onDragEnd={handleDragEnd}
+            >
+              <div className="grid gap-4 md:grid-cols-3">
+                {STATUS_COLUMNS.map((column) => {
+                  const items = visibleTodos[column.id];
+                  return (
+                    <KanbanColumn
+                      key={column.id}
+                      id={column.id}
+                      title={column.title}
+                      count={items.length}
+                      className={
+                        activeTab === column.id ? "" : "hidden md:flex"
+                      }
+                    >
+                      {isLoading && todos.length === 0 && renderSkeleton()}
+
+                      {items.map((todo) => (
+                        <DraggableTodoCard
+                          key={todo.id}
+                          todo={todo}
+                          onUpdateStatus={handleUpdateStatus}
+                          onViewDetails={(item) => setSelectedTodoId(item.id)}
+                          onToggleSubTodo={handleToggleSubTodo}
+                          onDeleteTodo={handleDeleteTodo}
+                          onDeleteSubTodo={handleDeleteSubTodo}
+                          dragEnabled={!isMobile}
+                        />
+                      ))}
+
+                      {!isLoading && items.length === 0 && (
+                        <div className="flex flex-1 flex-col items-center justify-center rounded-xl border border-dashed border-slate-300/80 px-4 py-10 text-center">
+                          <p className="text-sm font-medium text-slate-600">
+                            {searchQuery
+                              ? "No matching todos"
+                              : column.id === "DONE"
+                                ? "Nothing finished yet"
+                                : "No todos here"}
+                          </p>
+                          <p className="mt-1 text-xs text-slate-400">
+                            {searchQuery
+                              ? "Try a different keyword."
+                              : isMobile
+                                ? "Change a todo's status to move it here."
+                                : "Drag a card here or change its status."}
+                          </p>
+                        </div>
+                      )}
+
+                      {column.id === "TODO" && (
+                        <button
+                          type="button"
+                          onClick={() => setShowCreateModal(true)}
+                          className="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-slate-500 transition hover:bg-white hover:text-brand-500 hover:shadow-card"
+                        >
+                          <PlusIcon width={16} height={16} />
+                          Add todo
+                        </button>
+                      )}
+                    </KanbanColumn>
+                  );
+                })}
+              </div>
+            </DndContext>
+          </>
+        )}
+      </main>
+
+      {/* Mobile floating action button */}
+      <button
+        type="button"
+        onClick={() =>
+          view === "board"
+            ? setShowCreateModal(true)
+            : setRoutineCreateSignal((value) => value + 1)
+        }
+        style={{ bottom: "calc(4.75rem + env(safe-area-inset-bottom))" }}
+        className="fixed right-5 z-30 inline-flex h-14 w-14 items-center justify-center rounded-full bg-brand-500 text-white shadow-lg shadow-brand-500/40 transition active:scale-95 md:hidden"
+        aria-label={view === "board" ? "Create todo" : "Create routine"}
+      >
+        <PlusIcon width={24} height={24} strokeWidth={2.5} />
+      </button>
+
+      {/* Mobile bottom navigation */}
+      <nav
+        aria-label="Views"
+        className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200/80 bg-white/90 backdrop-blur-lg md:hidden"
+        style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+      >
+        <div className="grid h-16 grid-cols-2">
+          {VIEWS.map((item) => {
+            const isActive = view === item.id;
+            const Icon = item.id === "board" ? BoardIcon : RepeatIcon;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => changeView(item.id)}
+                aria-current={isActive ? "page" : undefined}
+                className={`flex flex-col items-center justify-center gap-1 text-xs font-semibold transition ${
+                  isActive ? "text-brand-500" : "text-slate-400"
+                }`}
+              >
+                <Icon
+                  width={22}
+                  height={22}
+                  strokeWidth={isActive ? 2.25 : 2}
+                />
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+      </nav>
 
       {selectedTodo && (
         <TodoDetailsModal
           todo={selectedTodo}
           onClose={() => setSelectedTodoId(null)}
-          onUpdateStatus={handleUpdateStatus}
+          onSave={handleSaveTodo}
           onCreateSubTodo={handleCreateSubTodo}
           onToggleSubTodo={handleToggleSubTodo}
+          onRenameSubTodo={handleRenameSubTodo}
           onDeleteTodo={handleDeleteTodo}
           onDeleteSubTodo={handleDeleteSubTodo}
-          onUpdateDetails={handleUpdateDetails}
-          onUpdateTimeline={handleUpdateTimeline}
-          onUpdateImage={handleUpdateImage}
         />
       )}
 
       {showCreateModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-xl overflow-hidden rounded-2xl bg-white shadow-xl">
-            <header className="border-b border-gray-200 px-6 py-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.2em] text-gray-400">
-                    New Todo
-                  </p>
-                  <h2 className="text-lg font-semibold text-gray-900">
-                    Create a todo
-                  </h2>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowCreateModal(false);
-                    setFormState(initialRootForm);
-                    setFormError(null);
-                  }}
-                  className="rounded-full border border-gray-200 px-3 py-1 text-xs text-gray-500 transition hover:bg-gray-100"
-                >
-                  Close
-                </button>
-              </div>
+        <div
+          className="fixed inset-0 z-50 flex animate-fade-in items-end justify-center bg-slate-900/50 backdrop-blur-sm sm:items-center sm:p-4"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) closeCreateModal();
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="create-todo-title"
+            className="flex max-h-[92vh] w-full animate-sheet-up flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl sm:max-w-lg sm:rounded-2xl"
+          >
+            <div className="mx-auto mt-2.5 h-1 w-10 rounded-full bg-slate-300 sm:hidden" />
+            <header className="flex items-center justify-between px-5 pb-3 pt-3 sm:px-6 sm:pt-5">
+              <h2
+                id="create-todo-title"
+                className="text-lg font-semibold text-slate-900"
+              >
+                New todo
+              </h2>
+              <button
+                type="button"
+                onClick={closeCreateModal}
+                className="icon-btn"
+                aria-label="Close"
+              >
+                <XIcon />
+              </button>
             </header>
-            <form onSubmit={handleCreateTodo} className="space-y-4 px-6 py-5">
-              <div className="grid gap-1">
-                <label
-                  className="text-sm font-semibold text-gray-800"
-                  htmlFor="modal-title"
-                >
-                  Title
-                </label>
-                <input
-                  id="modal-title"
-                  type="text"
-                  value={formState.title}
-                  onChange={(event) =>
-                    setFormState((prev) => ({
-                      ...prev,
-                      title: event.target.value,
-                    }))
-                  }
-                  className="w-full rounded-lg border border-gray-300 bg-gray-50 px-4 py-2 text-sm focus:border-brand-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-                  placeholder="Kick-off meeting"
-                />
-              </div>
-              <div className="grid gap-1">
-                <label
-                  className="text-sm font-semibold text-gray-800"
-                  htmlFor="modal-description"
-                >
-                  Description
-                </label>
-                <textarea
-                  id="modal-description"
-                  value={formState.description}
-                  onChange={(event) =>
-                    setFormState((prev) => ({
-                      ...prev,
-                      description: event.target.value,
-                    }))
-                  }
-                  className="w-full rounded-lg border border-gray-300 bg-gray-50 px-4 py-2 text-sm focus:border-brand-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-                  rows={3}
-                  placeholder="Context, goals, links..."
-                />
-              </div>
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="grid gap-1">
-                  <label
-                    className="text-sm font-semibold text-gray-800"
-                    htmlFor="modal-start"
-                  >
-                    Start date
+            <form
+              onSubmit={handleCreateTodo}
+              className="flex min-h-0 flex-1 flex-col"
+            >
+              <div className="flex-1 space-y-4 overflow-y-auto px-5 pb-4 sm:px-6">
+                <div className="grid gap-1.5">
+                  <label className="field-label" htmlFor="modal-title">
+                    Title
                   </label>
                   <input
-                    id="modal-start"
-                    type="date"
-                    value={formState.startDate}
+                    id="modal-title"
+                    type="text"
+                    autoFocus
+                    value={formState.title}
                     onChange={(event) =>
                       setFormState((prev) => ({
                         ...prev,
-                        startDate: event.target.value,
+                        title: event.target.value,
                       }))
                     }
-                    className="w-full rounded-lg border border-gray-300 bg-gray-50 px-4 py-2 text-sm focus:border-brand-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-500/30"
+                    className="field"
+                    placeholder="Kick-off meeting"
                   />
                 </div>
-                <div className="grid gap-1">
-                  <label
-                    className="text-sm font-semibold text-gray-800"
-                    htmlFor="modal-end"
-                  >
-                    End date
-                  </label>
-                  <input
-                    id="modal-end"
-                    type="date"
-                    value={formState.endDate}
-                    onChange={(event) =>
-                      setFormState((prev) => ({
-                        ...prev,
-                        endDate: event.target.value,
-                      }))
-                    }
-                    className="w-full rounded-lg border border-gray-300 bg-gray-50 px-4 py-2 text-sm focus:border-brand-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand-500/30"
-                  />
-                </div>
-              </div>
-              <div className="grid gap-1">
-                <label
-                  className="text-sm font-semibold text-gray-800"
-                  htmlFor="modal-image"
-                >
-                  Reference image (optional)
-                </label>
-                <input
-                  id="modal-image"
-                  type="file"
-                  accept="image/*"
-                  onChange={(event) =>
-                    setFormState((prev) => ({
-                      ...prev,
-                      image: event.target.files?.[0] ?? null,
-                    }))
-                  }
-                  className="text-sm"
-                />
-                <p className="text-xs text-gray-500">
-                  Attach mockups, briefs, or supporting screenshots if you have
-                  them.
-                </p>
-              </div>
-              {formError && (
-                <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-                  {formError}
-                </p>
-              )}
-              <div className="flex items-center justify-end gap-3">
                 <button
                   type="button"
-                  onClick={() => (
-                    setShowCreateModal(false),
-                    setFormState(initialRootForm),
-                    setFormError(null)
-                  )}
-                  className="rounded-full border border-gray-200 px-4 py-2 text-sm text-gray-600 transition hover:bg-gray-100"
+                  onClick={() => setShowMoreOptions((open) => !open)}
+                  aria-expanded={showMoreOptions}
+                  aria-controls="create-more-options"
+                  className="flex items-center gap-1.5 text-sm font-semibold text-slate-600 hover:text-slate-900"
+                >
+                  <ChevronIcon
+                    width={16}
+                    height={16}
+                    className={`transition-transform ${
+                      showMoreOptions ? "rotate-90" : ""
+                    }`}
+                  />
+                  More options
+                  <span className="font-normal text-slate-400">
+                    (notes, dates, image)
+                  </span>
+                </button>
+                {showMoreOptions && (
+                  <div id="create-more-options" className="space-y-4">
+                  <div className="grid gap-1.5">
+                    <label className="field-label" htmlFor="modal-description">
+                      Notes
+                    </label>
+                    <textarea
+                      id="modal-description"
+                      value={formState.description}
+                      onChange={(event) =>
+                        setFormState((prev) => ({
+                          ...prev,
+                          description: event.target.value,
+                        }))
+                      }
+                      className="field resize-none"
+                      rows={2}
+                      placeholder="Thêm ghi chú…"
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="grid min-w-0 gap-1.5">
+                      <label className="field-label" htmlFor="modal-start">
+                        Start date
+                      </label>
+                      <input
+                        id="modal-start"
+                        type="date"
+                        value={formState.startDate}
+                        onChange={(event) =>
+                          setFormState((prev) => ({
+                            ...prev,
+                            startDate: event.target.value,
+                          }))
+                        }
+                        className="field min-h-[44px]"
+                      />
+                    </div>
+                    <div className="grid min-w-0 gap-1.5">
+                      <label className="field-label" htmlFor="modal-end">
+                        End date
+                      </label>
+                      <input
+                        id="modal-end"
+                        type="date"
+                        value={formState.endDate}
+                        onChange={(event) =>
+                          setFormState((prev) => ({
+                            ...prev,
+                            endDate: event.target.value,
+                          }))
+                        }
+                        className="field min-h-[44px]"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid gap-1.5">
+                    <span className="field-label">Reference image</span>
+                    <label
+                      htmlFor="modal-image"
+                      className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-600 transition hover:border-brand-400 hover:bg-brand-50/40"
+                    >
+                      <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-slate-500 shadow-sm">
+                        <DownloadIcon className="rotate-180" />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-medium text-slate-700">
+                          {formState.image
+                            ? formState.image.name
+                            : "Choose an image (optional)"}
+                        </span>
+                        <span className="block text-xs text-slate-400">
+                          Mockups, briefs, or screenshots
+                        </span>
+                      </span>
+                      <input
+                        id="modal-image"
+                        type="file"
+                        accept="image/*"
+                        className="sr-only"
+                        onChange={(event) =>
+                          setFormState((prev) => ({
+                            ...prev,
+                            image: event.target.files?.[0] ?? null,
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  </div>
+                )}
+                {formError && (
+                  <p className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                    {formError}
+                  </p>
+                )}
+              </div>
+              <div className="pb-safe flex items-center gap-3 border-t border-slate-100 bg-slate-50/60 px-5 pt-4 sm:justify-end sm:px-6 sm:pb-4">
+                <button
+                  type="button"
+                  onClick={closeCreateModal}
+                  className="btn-secondary flex-1 sm:flex-none"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={isSubmitting}
-                  className="inline-flex items-center rounded-full bg-brand-500 px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-brand-500/20 transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:opacity-70"
+                  className="btn-primary flex-1 sm:flex-none"
                 >
                   {isSubmitting ? "Creating..." : "Create todo"}
                 </button>

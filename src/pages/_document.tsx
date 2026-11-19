@@ -33,10 +33,25 @@ class MyDocument extends Document {
             sizes="180x180"
             href="/frontend_todo/apple-touch-icon.png"
           />
-          <meta name="apple-mobile-web-app-title" content="MyWebSite" />
+          <meta name="apple-mobile-web-app-title" content="Todo Board" />
+          <meta name="apple-mobile-web-app-capable" content="yes" />
+          <meta
+            name="apple-mobile-web-app-status-bar-style"
+            content="default"
+          />
+          <link rel="preconnect" href="https://fonts.googleapis.com" />
+          <link
+            rel="preconnect"
+            href="https://fonts.gstatic.com"
+            crossOrigin="anonymous"
+          />
+          <link
+            href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+            rel="stylesheet"
+          />
           <link rel="manifest" href="/frontend_todo/site.webmanifest" />
         </Head>
-        <body className="bg-gray-100 text-gray-900">
+        <body className="bg-slate-50 text-slate-900">
           <Main />
           <NextScript />
         </body>
