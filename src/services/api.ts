@@ -78,7 +78,7 @@ export const clearAuthToken = () => {
   setAuthToken(null);
 };
 
-const withAuthHeaders = (headers: HeadersInit = {}) => {
+export const withAuthHeaders = (headers: HeadersInit = {}) => {
   const token = getStoredToken();
   if (!token) return headers;
   return {
@@ -125,35 +125,70 @@ export async function createTodo(data: FormData): Promise<Todo> {
   return handleResponse<Todo>(res);
 }
 
-export async function updateTodo(
-  id: number,
-  payload: {
-    title?: string | null;
-    description?: string | null;
-    startDate?: string | null;
-    endDate?: string | null;
-  }
-): Promise<Todo> {
-  const res = await fetch(`${API_URL}/api/todos/${id}`, {
-    method: "PATCH",
-    headers: withAuthHeaders({
-      ...jsonHeaders,
-      "Content-Type": "application/json",
-    }),
-    body: JSON.stringify(payload),
-  });
-  return handleResponse<Todo>(res);
+/** Fields the todo detail form can change in one Save. */
+export interface TodoChanges {
+  title?: string;
+  description?: string | null;
+  status?: Todo["status"];
+  /** `YYYY-MM-DD`, or null to clear. Ignored by the backend for subtodos. */
+  startDate?: string | null;
+  endDate?: string | null;
+  /** A new image to upload. */
+  imageFile?: File | null;
+  /** Remove the current image (only used when no `imageFile` is sent). */
+  removeImage?: boolean;
 }
 
-export async function updateTodoWithImage(
+export const OFFLINE_SAVE_MESSAGE = "Không có kết nối, chưa lưu được";
+
+/**
+ * Saves every changed field of a todo with a single
+ * `PATCH /api/todos/:id` (multipart). Only fields present in `changes`
+ * are sent. Not queued offline: the caller shows an error instead.
+ */
+export async function saveTodo(
   id: number,
-  formData: FormData
+  changes: TodoChanges,
 ): Promise<Todo> {
-  const res = await fetch(`${API_URL}/api/todos/${id}`, {
-    method: "PATCH",
-    headers: withAuthHeaders(),
-    body: formData,
-  });
+  if (typeof navigator !== "undefined" && !navigator.onLine) {
+    throw new Error(OFFLINE_SAVE_MESSAGE);
+  }
+
+  const form = new FormData();
+  if (typeof changes.title !== "undefined") {
+    form.append("title", changes.title);
+  }
+  if (typeof changes.description !== "undefined") {
+    form.append("description", changes.description ?? "");
+  }
+  if (typeof changes.status !== "undefined") {
+    form.append("status", changes.status);
+  }
+  if (typeof changes.startDate !== "undefined") {
+    form.append("startDate", changes.startDate ?? "");
+  }
+  if (typeof changes.endDate !== "undefined") {
+    form.append("endDate", changes.endDate ?? "");
+  }
+  if (changes.imageFile) {
+    form.append("image", changes.imageFile);
+  } else if (changes.removeImage) {
+    form.append("imageUrl", "");
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}/api/todos/${id}`, {
+      method: "PATCH",
+      headers: withAuthHeaders(jsonHeaders),
+      body: form,
+    });
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(OFFLINE_SAVE_MESSAGE);
+    }
+    throw error;
+  }
   return handleResponse<Todo>(res);
 }
 
