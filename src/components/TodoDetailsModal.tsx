@@ -11,14 +11,9 @@ import {
 import type { Todo, TodoChanges } from "../services/api";
 import { API_URL } from "../services/api";
 import { formatDateForInput } from "../utils/timeline";
-import {
-  ChevronIcon,
-  ImageIcon,
-  PlusIcon,
-  TrashIcon,
-  XIcon,
-} from "./icons";
+import { ChevronIcon, ImageIcon, PlusIcon, TrashIcon, XIcon } from "./icons";
 import { STATUS_META, STATUS_ORDER } from "./status";
+import DatePicker from "./DatePicker";
 
 interface TodoDetailsModalProps {
   todo: Todo;
@@ -450,32 +445,30 @@ export default function TodoDetailsModal({
 
           {/* Dates */}
           <div className="grid grid-cols-2 gap-3">
-            <label className="grid min-w-0 gap-1.5">
+            <div className="grid min-w-0 gap-1.5">
               <span className="field-label">Start</span>
-              <input
-                type="date"
+              <DatePicker
                 value={draft.startDate}
                 max={draft.endDate || undefined}
-                onChange={(event) =>
-                  updateDraft({ startDate: event.target.value })
-                }
+                rangeWith={draft.endDate || undefined}
+                onChange={(startDate) => updateDraft({ startDate })}
                 disabled={isSaving}
-                className="field min-h-[44px]"
+                placeholder="Ngày bắt đầu"
+                aria-label="Ngày bắt đầu"
               />
-            </label>
-            <label className="grid min-w-0 gap-1.5">
+            </div>
+            <div className="grid min-w-0 gap-1.5">
               <span className="field-label">End</span>
-              <input
-                type="date"
+              <DatePicker
                 value={draft.endDate}
                 min={draft.startDate || undefined}
-                onChange={(event) =>
-                  updateDraft({ endDate: event.target.value })
-                }
+                rangeWith={draft.startDate || undefined}
+                onChange={(endDate) => updateDraft({ endDate })}
                 disabled={isSaving}
-                className="field min-h-[44px]"
+                placeholder="Ngày kết thúc"
+                aria-label="Ngày kết thúc"
               />
-            </label>
+            </div>
           </div>
 
           {/* Notes */}

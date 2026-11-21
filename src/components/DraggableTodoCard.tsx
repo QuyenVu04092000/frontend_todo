@@ -1,6 +1,13 @@
 import { CSS } from "@dnd-kit/utilities";
 import { useDraggable } from "@dnd-kit/core";
-import { useMemo, type SyntheticEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  type KeyboardEvent,
+  type MouseEvent,
+  type SyntheticEvent,
+} from "react";
 
 import type { Todo } from "../services/api";
 import { API_URL } from "../services/api";
@@ -27,6 +34,9 @@ interface DraggableTodoCardProps {
 
 const MAX_VISIBLE_SUBTODOS = 3;
 
+// Clicks on these open nothing: they are controls with their own action.
+const INTERACTIVE_SELECTOR = "button, a, input, select, textarea, label";
+
 // Keep taps on controls from starting a drag.
 const stopDrag = (event: SyntheticEvent) => event.stopPropagation();
 const noDragProps = {
@@ -52,6 +62,33 @@ const DraggableTodoCard = ({
     });
   const dragProps = dragEnabled ? { ...attributes, ...listeners } : {};
 
+  // The whole card is the drag handle; a plain click (no drag) opens the
+  // details. Remember when a drag happened so the click fired on drop
+  // doesn't open the modal.
+  const draggedRef = useRef(false);
+  useEffect(() => {
+    if (isDragging) draggedRef.current = true;
+  }, [isDragging]);
+
+  const handleCardClick = (event: MouseEvent<HTMLElement>) => {
+    if (draggedRef.current) {
+      draggedRef.current = false;
+      return;
+    }
+    const target = event.target as HTMLElement;
+    const control = target.closest(INTERACTIVE_SELECTOR);
+    if (control && control !== event.currentTarget) return;
+    onViewDetails(todo);
+  };
+
+  const handleCardKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.target !== event.currentTarget) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      onViewDetails(todo);
+    }
+  };
+
   const style = {
     transform: transform ? CSS.Translate.toString(transform) : undefined,
     transition: isDragging
@@ -63,7 +100,7 @@ const DraggableTodoCard = ({
   const subtodos = todo.subtodos ?? [];
   const completedSubTodos = useMemo(
     () => subtodos.filter((sub) => sub.status === "DONE").length,
-    [subtodos]
+    [subtodos],
   );
   const progress = subtodos.length
     ? Math.round((completedSubTodos / subtodos.length) * 100)
@@ -105,8 +142,18 @@ const DraggableTodoCard = ({
       ref={setNodeRef}
       style={style}
       {...dragProps}
-      className={`group relative flex touch-manipulation flex-col gap-3 rounded-xl border bg-white p-3.5 text-left transition-shadow duration-200 ${
-        dragEnabled ? "cursor-grab active:cursor-grabbing" : ""
+      onPointerDownCapture={() => {
+        draggedRef.current = false;
+      }}
+      onClick={handleCardClick}
+      onKeyDown={handleCardKeyDown}
+      aria-label={`${todo.title}. Click to open details${
+        dragEnabled ? ", drag to change status" : ""
+      }`}
+      className={`group relative flex cursor-pointer touch-manipulation flex-col gap-3 rounded-xl border bg-white p-3.5 text-left transition-shadow duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/40 ${
+        dragEnabled
+          ? "select-none md:cursor-grab md:active:cursor-grabbing"
+          : ""
       } ${
         isDragging
           ? "border-brand-300 shadow-lift ring-2 ring-brand-500/20"
@@ -114,12 +161,7 @@ const DraggableTodoCard = ({
       } ${isPending ? "opacity-70" : ""}`}
     >
       <header className="flex items-start gap-2">
-        <button
-          type="button"
-          {...noDragProps}
-          onClick={() => onViewDetails(todo)}
-          className="min-w-0 flex-1 text-left"
-        >
+        <div className="min-w-0 flex-1 text-left">
           <h3
             className={`break-words text-[15px] font-semibold leading-snug ${
               todo.status === "DONE"
@@ -155,7 +197,7 @@ const DraggableTodoCard = ({
               )}
             </span>
           )}
-        </button>
+        </div>
         <div className="-mr-1 -mt-1 flex shrink-0 items-center opacity-100 transition md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
           <button
             type="button"
@@ -185,12 +227,7 @@ const DraggableTodoCard = ({
       </header>
 
       {imageSrc && (
-        <button
-          type="button"
-          {...noDragProps}
-          onClick={() => onViewDetails(todo)}
-          className="overflow-hidden rounded-lg border border-slate-100 bg-slate-50"
-        >
+        <div className="overflow-hidden rounded-lg border border-slate-100 bg-slate-50">
           <img
             src={imageSrc}
             alt={`${todo.title} reference`}
@@ -198,7 +235,7 @@ const DraggableTodoCard = ({
             loading="lazy"
             draggable={false}
           />
-        </button>
+        </div>
       )}
 
       {subtodos.length > 0 && (
@@ -339,19 +376,19 @@ const DraggableTodoCard = ({
         )}
 
         {showMarkAllDone && (
-            <button
-              type="button"
-              {...noDragProps}
-              onClick={async () => {
-                await Promise.all(
-                  subtodos.map((sub) => onToggleSubTodo(sub, true))
-                );
-              }}
-              className="ml-auto text-xs font-medium text-brand-500 hover:text-brand-600"
-            >
-              Mark checklist done
-            </button>
-          )}
+          <button
+            type="button"
+            {...noDragProps}
+            onClick={async () => {
+              await Promise.all(
+                subtodos.map((sub) => onToggleSubTodo(sub, true)),
+              );
+            }}
+            className="ml-auto text-xs font-medium text-brand-500 hover:text-brand-600"
+          >
+            Mark checklist done
+          </button>
+        )}
 
         {isPending && (
           <span className="ml-auto text-xs italic text-slate-400">
