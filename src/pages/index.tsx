@@ -46,6 +46,7 @@ import {
   XIcon,
 } from "../components/icons";
 import TodoDetailsModal from "../components/TodoDetailsModal";
+import DatePicker from "../components/DatePicker";
 import RoutinesView from "../components/RoutinesView";
 import {
   enqueueOperation,
@@ -1385,7 +1386,7 @@ export default function HomePage() {
   useEffect(() => {
     if (!showCreateModal) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeCreateModal();
+      if (event.key === "Escape" && !event.defaultPrevented) closeCreateModal();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -1934,34 +1935,32 @@ export default function HomePage() {
                         <label className="field-label" htmlFor="modal-start">
                           Start date
                         </label>
-                        <input
+                        <DatePicker
                           id="modal-start"
-                          type="date"
                           value={formState.startDate}
-                          onChange={(event) =>
-                            setFormState((prev) => ({
-                              ...prev,
-                              startDate: event.target.value,
-                            }))
+                          max={formState.endDate || undefined}
+                          rangeWith={formState.endDate || undefined}
+                          onChange={(startDate) =>
+                            setFormState((prev) => ({ ...prev, startDate }))
                           }
-                          className="field min-h-[44px]"
+                          placeholder="Ngày bắt đầu"
+                          aria-label="Ngày bắt đầu"
                         />
                       </div>
                       <div className="grid min-w-0 gap-1.5">
                         <label className="field-label" htmlFor="modal-end">
                           End date
                         </label>
-                        <input
+                        <DatePicker
                           id="modal-end"
-                          type="date"
                           value={formState.endDate}
-                          onChange={(event) =>
-                            setFormState((prev) => ({
-                              ...prev,
-                              endDate: event.target.value,
-                            }))
+                          min={formState.startDate || undefined}
+                          rangeWith={formState.startDate || undefined}
+                          onChange={(endDate) =>
+                            setFormState((prev) => ({ ...prev, endDate }))
                           }
-                          className="field min-h-[44px]"
+                          placeholder="Ngày kết thúc"
+                          aria-label="Ngày kết thúc"
                         />
                       </div>
                     </div>
