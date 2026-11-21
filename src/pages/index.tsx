@@ -67,6 +67,8 @@ interface RootFormState {
   startDate: string;
   endDate: string;
   image: File | null;
+  /** Checklist steps added before the todo is created. */
+  steps: string[];
 }
 
 const initialRootForm: RootFormState = {
@@ -75,6 +77,7 @@ const initialRootForm: RootFormState = {
   startDate: "",
   endDate: "",
   image: null,
+  steps: [],
 };
 
 const LOCAL_CACHE_KEY = "todo_cached_todos_v1";
@@ -112,6 +115,30 @@ const removeTodoFromTree = (list: Todo[], targetId: number): Todo[] =>
         ? removeTodoFromTree(todo.subtodos, targetId)
         : todo.subtodos,
     }));
+
+const hasTodoInTree = (list: Todo[], targetId: number): boolean =>
+  list.some(
+    (todo) =>
+      todo.id === targetId ||
+      (todo.subtodos ? hasTodoInTree(todo.subtodos, targetId) : false),
+  );
+
+// Swap a temporary (optimistic) todo for the saved one, keeping its position.
+const replaceTodoInTree = (
+  list: Todo[],
+  targetId: number,
+  replacement: Todo,
+): Todo[] =>
+  list.map((todo) => {
+    if (todo.id === targetId) return replacement;
+    if (todo.subtodos?.length) {
+      return {
+        ...todo,
+        subtodos: replaceTodoInTree(todo.subtodos, targetId, replacement),
+      };
+    }
+    return todo;
+  });
 
 const addSubTodoToParent = (
   list: Todo[],
@@ -303,6 +330,7 @@ export default function HomePage() {
   const [selectedTodoId, setSelectedTodoId] = useState<number | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [showMoreOptions, setShowMoreOptions] = useState(false);
+  const [newCreateStep, setNewCreateStep] = useState("");
   const [activeTab, setActiveTab] = useState<Todo["status"]>("TODO");
   const [searchQuery, setSearchQuery] = useState("");
   const [view, setView] = useState<AppView>("board");
@@ -764,6 +792,17 @@ export default function HomePage() {
       return;
     }
 
+    // Text still in the step input counts as a step too.
+    const stepTitles = [...formState.steps, newCreateStep]
+      .map((step) => step.trim())
+      .filter(Boolean);
+
+    const isOffline = typeof navigator !== "undefined" && !navigator.onLine;
+    if (isOffline && stepTitles.length > 0) {
+      setFormError("Cần có kết nối mạng để tạo checklist.");
+      return;
+    }
+
     setIsSubmitting(true);
     setFormError(null);
 
@@ -795,6 +834,19 @@ export default function HomePage() {
       subtodos: [],
       timeline: [],
     };
+    // Steps show up right away as pending (negative ids) until saved.
+    const optimisticSteps: Todo[] = stepTitles.map((title, index) => ({
+      id: tempId - index - 1,
+      title,
+      description: null,
+      status: "TODO",
+      parentId: tempId,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      subtodos: [],
+      timeline: [],
+    }));
+    optimisticTodo.subtodos = optimisticSteps;
 
     updateTodosState((prev) => [optimisticTodo, ...prev]);
 
@@ -805,11 +857,52 @@ export default function HomePage() {
       const normalized = normalizeTodo(created);
       updateTodosState((prev) => {
         const trimmed = removeTodoFromTree(prev, tempId);
-        return [normalized, ...trimmed];
+        return [
+          {
+            ...normalized,
+            subtodos: optimisticSteps.map((step) => ({
+              ...step,
+              parentId: normalized.id,
+            })),
+          },
+          ...trimmed,
+        ];
       });
       setFormState(initialRootForm);
+      setNewCreateStep("");
       setFormError(null);
       setShowCreateModal(false);
+      setShowMoreOptions(false);
+      setIsSubmitting(false);
+
+      // Create the steps one by one so they keep the order they were typed in.
+      let failed = 0;
+      for (const step of optimisticSteps) {
+        try {
+          const savedStep = await createTodo(
+            buildFormData({ title: step.title, status: "TODO" }, normalized.id),
+          );
+          const saved = normalizeTodo(savedStep);
+          updateTodosState((prev) => {
+            if (hasTodoInTree(prev, step.id)) {
+              return replaceTodoInTree(prev, step.id, saved);
+            }
+            // An SSE update may have replaced the parent (dropping pending
+            // steps); attach the saved step unless it is already there.
+            return hasTodoInTree(prev, saved.id)
+              ? prev
+              : addSubTodoToParent(prev, normalized.id, saved);
+          });
+        } catch {
+          failed += 1;
+          updateTodosState((prev) => removeTodoFromTree(prev, step.id));
+        }
+      }
+      if (failed > 0) {
+        setError(
+          `Đã tạo todo nhưng không thêm được ${failed} bước checklist. Mở todo để thêm lại.`,
+        );
+      }
       void loadTodos();
     } catch (err) {
       if (isOfflineError(err)) {
@@ -1015,9 +1108,7 @@ export default function HomePage() {
   // Status changes are batched: each change (re)starts a short timer, and when
   // it fires everything queued so far goes out in one request. Leaving the page
   // (pagehide) and coming back online still flush immediately.
-  const statusSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
-    null,
-  );
+  const statusSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const scheduleStatusSync = useCallback(() => {
     if (statusSyncTimerRef.current) {
@@ -1286,6 +1377,7 @@ export default function HomePage() {
   const closeCreateModal = useCallback(() => {
     setShowCreateModal(false);
     setShowMoreOptions(false);
+    setNewCreateStep("");
     setFormState(initialRootForm);
     setFormError(null);
   }, []);
@@ -1726,6 +1818,75 @@ export default function HomePage() {
                     placeholder="Kick-off meeting"
                   />
                 </div>
+                <div className="grid gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="field-label">Checklist</span>
+                    {formState.steps.length > 0 && (
+                      <span className="text-xs font-medium tabular-nums text-slate-500">
+                        {formState.steps.length} bước
+                      </span>
+                    )}
+                  </div>
+                  <ul className="divide-y divide-slate-100 overflow-hidden rounded-xl border border-slate-200">
+                    {formState.steps.map((step, index) => (
+                      <li
+                        key={`${index}-${step}`}
+                        className="flex items-center gap-3 bg-white px-3 py-1.5"
+                      >
+                        <span className="h-4 w-4 shrink-0 rounded border border-slate-300" />
+                        <span className="min-w-0 flex-1 break-words py-1 text-sm text-slate-800">
+                          {step}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setFormState((prev) => ({
+                              ...prev,
+                              steps: prev.steps.filter((_, i) => i !== index),
+                            }))
+                          }
+                          className="icon-btn h-8 w-8 shrink-0 hover:bg-red-50 hover:text-red-600"
+                          aria-label={`Bỏ bước ${step}`}
+                        >
+                          <XIcon width={15} height={15} />
+                        </button>
+                      </li>
+                    ))}
+                    <li className="flex items-center gap-2 bg-white px-3">
+                      <PlusIcon
+                        width={18}
+                        height={18}
+                        className="shrink-0 text-slate-400"
+                      />
+                      <input
+                        type="text"
+                        value={newCreateStep}
+                        onChange={(event) =>
+                          setNewCreateStep(event.target.value)
+                        }
+                        onKeyDown={(event) => {
+                          // Enter adds a step instead of submitting the form.
+                          if (
+                            event.key !== "Enter" ||
+                            event.nativeEvent.isComposing
+                          )
+                            return;
+                          event.preventDefault();
+                          const step = newCreateStep.trim();
+                          if (!step) return;
+                          setFormState((prev) => ({
+                            ...prev,
+                            steps: [...prev.steps, step],
+                          }));
+                          setNewCreateStep("");
+                        }}
+                        placeholder="Thêm bước… (Enter để thêm)"
+                        aria-label="Thêm bước checklist"
+                        className="min-w-0 flex-1 bg-transparent py-2.5 text-base text-slate-800 placeholder:text-slate-400 focus:outline-none sm:text-sm"
+                      />
+                    </li>
+                  </ul>
+                </div>
                 <button
                   type="button"
                   onClick={() => setShowMoreOptions((open) => !open)}
@@ -1747,93 +1908,96 @@ export default function HomePage() {
                 </button>
                 {showMoreOptions && (
                   <div id="create-more-options" className="space-y-4">
-                  <div className="grid gap-1.5">
-                    <label className="field-label" htmlFor="modal-description">
-                      Notes
-                    </label>
-                    <textarea
-                      id="modal-description"
-                      value={formState.description}
-                      onChange={(event) =>
-                        setFormState((prev) => ({
-                          ...prev,
-                          description: event.target.value,
-                        }))
-                      }
-                      className="field resize-none"
-                      rows={2}
-                      placeholder="Thêm ghi chú…"
-                    />
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="grid min-w-0 gap-1.5">
-                      <label className="field-label" htmlFor="modal-start">
-                        Start date
+                    <div className="grid gap-1.5">
+                      <label
+                        className="field-label"
+                        htmlFor="modal-description"
+                      >
+                        Notes
                       </label>
-                      <input
-                        id="modal-start"
-                        type="date"
-                        value={formState.startDate}
+                      <textarea
+                        id="modal-description"
+                        value={formState.description}
                         onChange={(event) =>
                           setFormState((prev) => ({
                             ...prev,
-                            startDate: event.target.value,
+                            description: event.target.value,
                           }))
                         }
-                        className="field min-h-[44px]"
+                        className="field resize-none"
+                        rows={2}
+                        placeholder="Thêm ghi chú…"
                       />
                     </div>
-                    <div className="grid min-w-0 gap-1.5">
-                      <label className="field-label" htmlFor="modal-end">
-                        End date
-                      </label>
-                      <input
-                        id="modal-end"
-                        type="date"
-                        value={formState.endDate}
-                        onChange={(event) =>
-                          setFormState((prev) => ({
-                            ...prev,
-                            endDate: event.target.value,
-                          }))
-                        }
-                        className="field min-h-[44px]"
-                      />
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid min-w-0 gap-1.5">
+                        <label className="field-label" htmlFor="modal-start">
+                          Start date
+                        </label>
+                        <input
+                          id="modal-start"
+                          type="date"
+                          value={formState.startDate}
+                          onChange={(event) =>
+                            setFormState((prev) => ({
+                              ...prev,
+                              startDate: event.target.value,
+                            }))
+                          }
+                          className="field min-h-[44px]"
+                        />
+                      </div>
+                      <div className="grid min-w-0 gap-1.5">
+                        <label className="field-label" htmlFor="modal-end">
+                          End date
+                        </label>
+                        <input
+                          id="modal-end"
+                          type="date"
+                          value={formState.endDate}
+                          onChange={(event) =>
+                            setFormState((prev) => ({
+                              ...prev,
+                              endDate: event.target.value,
+                            }))
+                          }
+                          className="field min-h-[44px]"
+                        />
+                      </div>
                     </div>
-                  </div>
-                  <div className="grid gap-1.5">
-                    <span className="field-label">Reference image</span>
-                    <label
-                      htmlFor="modal-image"
-                      className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-600 transition hover:border-brand-400 hover:bg-brand-50/40"
-                    >
-                      <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-slate-500 shadow-sm">
-                        <DownloadIcon className="rotate-180" />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate font-medium text-slate-700">
-                          {formState.image
-                            ? formState.image.name
-                            : "Choose an image (optional)"}
+                    <div className="grid gap-1.5">
+                      <span className="field-label">Reference image</span>
+                      <label
+                        htmlFor="modal-image"
+                        className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-600 transition hover:border-brand-400 hover:bg-brand-50/40"
+                      >
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-slate-500 shadow-sm">
+                          <DownloadIcon className="rotate-180" />
                         </span>
-                        <span className="block text-xs text-slate-400">
-                          Mockups, briefs, or screenshots
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-medium text-slate-700">
+                            {formState.image
+                              ? formState.image.name
+                              : "Choose an image (optional)"}
+                          </span>
+                          <span className="block text-xs text-slate-400">
+                            Mockups, briefs, or screenshots
+                          </span>
                         </span>
-                      </span>
-                      <input
-                        id="modal-image"
-                        type="file"
-                        accept="image/*"
-                        className="sr-only"
-                        onChange={(event) =>
-                          setFormState((prev) => ({
-                            ...prev,
-                            image: event.target.files?.[0] ?? null,
-                          }))
-                        }
-                      />
-                    </label>
-                  </div>
+                        <input
+                          id="modal-image"
+                          type="file"
+                          accept="image/*"
+                          className="sr-only"
+                          onChange={(event) =>
+                            setFormState((prev) => ({
+                              ...prev,
+                              image: event.target.files?.[0] ?? null,
+                            }))
+                          }
+                        />
+                      </label>
+                    </div>
                   </div>
                 )}
                 {formError && (
